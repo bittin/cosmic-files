@@ -14,7 +14,7 @@ use cosmic::{
         stream,
         //TODO: export in cosmic::widget
         widget::{
-            container, horizontal_rule, rule,
+            horizontal_rule, rule,
             scrollable::{self, AbsoluteOffset, Viewport},
         },
         Alignment,
@@ -30,7 +30,7 @@ use cosmic::{
     iced_core::{mouse::ScrollDelta, widget::tree},
     theme,
     widget::{
-        self,
+        self, container,
         menu::{action::MenuAction, key_bind::KeyBind},
         DndDestination, DndSource, Id, Space, Widget,
     },
@@ -38,6 +38,7 @@ use cosmic::{
 };
 
 use chrono::{DateTime, Utc};
+use i18n_embed::LanguageLoader;
 use mime_guess::{mime, Mime};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -1005,6 +1006,7 @@ pub enum Command {
     ChangeLocation(String, Location, Option<PathBuf>),
     DropFiles(PathBuf, ClipboardPaste),
     EmptyTrash,
+    ExecEntryAction(cosmic::desktop::DesktopEntryData, usize),
     Iced(TaskWrapper),
     MoveToTrash(Vec<PathBuf>),
     OpenFile(PathBuf),
@@ -1034,6 +1036,7 @@ pub enum Message {
     EditLocationEnable,
     OpenInNewTab(PathBuf),
     EmptyTrash,
+    ExecEntryAction(Option<PathBuf>, usize),
     Gallery(bool),
     GalleryPrevious,
     GalleryNext,
@@ -1313,6 +1316,7 @@ impl Item {
     }
 
     fn preview<'a>(&'a self, sizes: IconSizes) -> Element<'a, app::Message> {
+        let spacing = cosmic::theme::active().cosmic().spacing;
         // This loads the image only if thumbnailing worked
         let icon = widget::icon::icon(self.icon_handle_grid.clone())
             .content_fit(ContentFit::Contain)
@@ -1333,10 +1337,16 @@ impl Item {
                 widget::image(handle.clone()).into()
             }
             ItemThumbnail::Svg(handle) => widget::svg(handle.clone()).into(),
-            ItemThumbnail::Text(content) => widget::container(widget::text_editor(content))
-                .width(Length::Fixed(THUMBNAIL_SIZE as f32))
-                .height(Length::Fixed(THUMBNAIL_SIZE as f32))
-                .into(),
+            ItemThumbnail::Text(content) => widget::container(
+                widget::text_editor(content)
+                    .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+                        text_editor_class,
+                    )))
+                    .padding(spacing.space_xxs),
+            )
+            .width(Length::Fixed(THUMBNAIL_SIZE as f32))
+            .height(Length::Fixed(THUMBNAIL_SIZE as f32))
+            .into(),
         }
     }
 
@@ -2312,6 +2322,24 @@ impl Tab {
             Message::EmptyTrash => {
                 commands.push(Command::EmptyTrash);
             }
+            Message::ExecEntryAction(path, action) => {
+                let lang_id = crate::localize::LANGUAGE_LOADER.current_language();
+                let language = lang_id.language.as_str();
+                match path.map_or_else(
+                    || {
+                        let items = self.items_opt.as_deref()?;
+                        items.iter().find(|item| item.selected).and_then(|item| {
+                            let location = item.location_opt.as_ref()?;
+                            let path = location.path_opt()?;
+                            cosmic::desktop::load_desktop_file(Some(language), path)
+                        })
+                    },
+                    |path| cosmic::desktop::load_desktop_file(Some(language), path),
+                ) {
+                    Some(entry) => commands.push(Command::ExecEntryAction(entry, action)),
+                    None => log::warn!("Invalid desktop entry path passed to ExecEntryAction"),
+                }
+            }
             Message::Gallery(gallery) => {
                 self.gallery = gallery;
             }
@@ -3101,7 +3129,14 @@ impl Tab {
                             );
                         }
                         ItemThumbnail::Text(text) => {
-                            element_opt = Some(widget::text_editor(text).into())
+                            element_opt = Some(
+                                widget::text_editor(text)
+                                    .padding(space_xxs)
+                                    .class(cosmic::theme::iced::TextEditor::Custom(Box::new(
+                                        text_editor_class,
+                                    )))
+                                    .into(),
+                            )
                         }
                     }
                 }
@@ -3250,7 +3285,7 @@ impl Tab {
         let heading_item = |name, width, msg| {
             let mut row = widget::row::with_capacity(2)
                 .align_y(Alignment::Center)
-                .spacing(space_xxs)
+                .spacing(space_xxxs)
                 .width(width);
             row = row.push(widget::text::heading(name));
             match (sort_name == msg, sort_direction) {
@@ -3287,8 +3322,17 @@ impl Tab {
         ])
         .align_y(Alignment::Center)
         .height(Length::Fixed((space_m + 4).into()))
-        .padding([0, space_xxs])
-        .spacing(space_xxs);
+        .padding([0, space_xxs]);
+
+        let accent_rule =
+            horizontal_rule(1).class(theme::Rule::Custom(Box::new(|theme| rule::Style {
+                color: theme.cosmic().accent_color().into(),
+                width: 1,
+                radius: 0.0.into(),
+                fill_mode: rule::FillMode::Full,
+            })));
+        let heading_rule = container(horizontal_rule(1))
+            .padding([0, theme::active().cosmic().corner_radii.radius_xs[0] as u16]);
 
         if let Some(location) = &self.edit_location {
             //TODO: allow editing other locations
@@ -3312,17 +3356,10 @@ impl Tab {
                 );
                 let mut column = widget::column::with_capacity(4).padding([0, space_s]);
                 column = column.push(row);
-                column = column.push(horizontal_rule(1).class(theme::Rule::Custom(Box::new(
-                    |theme| rule::Style {
-                        color: theme.cosmic().accent_color().into(),
-                        width: 1,
-                        radius: 0.0.into(),
-                        fill_mode: rule::FillMode::Full,
-                    },
-                ))));
+                column = column.push(accent_rule);
                 if self.config.view == View::List && !condensed {
                     column = column.push(heading_row);
-                    column = column.push(widget::divider::horizontal::default());
+                    column = column.push(heading_rule);
                 }
                 return column.into();
             }
@@ -3452,18 +3489,11 @@ impl Tab {
         }
         let mut column = widget::column::with_capacity(4).padding([0, space_s]);
         column = column.push(row);
-        column = column.push(
-            horizontal_rule(1).class(theme::Rule::Custom(Box::new(|theme| rule::Style {
-                color: theme.cosmic().accent_color().into(),
-                width: 1,
-                radius: 0.0.into(),
-                fill_mode: rule::FillMode::Full,
-            }))),
-        );
+        column = column.push(accent_rule);
 
         if self.config.view == View::List && !condensed {
             column = column.push(heading_row);
-            column = column.push(widget::divider::horizontal::default());
+            column = column.push(heading_rule);
         }
 
         let mouse_area = crate::mouse_area::MouseArea::new(column)
@@ -3507,10 +3537,7 @@ impl Tab {
             .align_x(Alignment::Center)
             .spacing(space_xxs),
         )
-        .align_x(Horizontal::Center)
-        .align_y(Vertical::Center)
-        .width(Length::Fill)
-        .height(Length::Fill)
+        .center(Length::Fill)
         .into()])
         .into()
     }
@@ -3820,7 +3847,6 @@ impl Tab {
             space_m,
             space_s,
             space_xxs,
-            space_xxxs,
             ..
         } = theme::active().cosmic().spacing;
 
@@ -3847,6 +3873,8 @@ impl Tab {
         let mut children: Vec<Element<_>> = Vec::new();
         let mut y = 0;
 
+        let rule_padding = theme::active().cosmic().corner_radii.radius_xs[0] as u16;
+
         let items = self.column_sort();
         let mut drag_items = Vec::new();
         if let Some(items) = items {
@@ -3868,7 +3896,7 @@ impl Tab {
                 if count > 0 {
                     children.push(
                         container(horizontal_rule(1))
-                            .padding([0, space_xxxs])
+                            .padding([0, rule_padding])
                             .into(),
                     );
                     y += 1;
@@ -3994,7 +4022,7 @@ impl Tab {
                                 item.selected,
                                 item.highlighted,
                                 true,
-                                false,
+                                true,
                                 false,
                             )),
                     )
@@ -4995,5 +5023,55 @@ impl<M> Widget<M, cosmic::Theme, cosmic::Renderer> for ArcElementWrapper<M> {
 impl<Message: 'static> From<ArcElementWrapper<Message>> for Element<'static, Message> {
     fn from(wrapper: ArcElementWrapper<Message>) -> Self {
         Element::new(wrapper)
+    }
+}
+
+fn text_editor_class(
+    theme: &cosmic::Theme,
+    status: cosmic::widget::text_editor::Status,
+) -> cosmic::iced_widget::text_editor::Style {
+    let cosmic = theme.cosmic();
+    let container = theme.current_container();
+
+    let mut background: cosmic::iced::Color = container.component.base.into();
+    background.a = 0.25;
+    let selection = cosmic.accent.base.into();
+    let value = cosmic.palette.neutral_9.into();
+    let mut placeholder = cosmic.palette.neutral_9;
+    placeholder.alpha = 0.7;
+    let placeholder = placeholder.into();
+    let icon = cosmic.background.on.into();
+
+    match status {
+        cosmic::iced_widget::text_editor::Status::Active
+        | cosmic::iced_widget::text_editor::Status::Disabled => {
+            cosmic::iced_widget::text_editor::Style {
+                background: background.into(),
+                border: cosmic::iced::Border {
+                    radius: cosmic.corner_radii.radius_m.into(),
+                    width: 2.0,
+                    color: container.component.divider.into(),
+                },
+                icon,
+                placeholder,
+                value,
+                selection,
+            }
+        }
+        cosmic::iced_widget::text_editor::Status::Hovered
+        | cosmic::iced_widget::text_editor::Status::Focused => {
+            cosmic::iced_widget::text_editor::Style {
+                background: background.into(),
+                border: cosmic::iced::Border {
+                    radius: cosmic.corner_radii.radius_m.into(),
+                    width: 2.0,
+                    color: cosmic::iced::Color::from(cosmic.accent.base),
+                },
+                icon,
+                placeholder,
+                value,
+                selection,
+            }
+        }
     }
 }
