@@ -26,6 +26,14 @@ modified = Modificato
 trashed-on = Spostato nel cestino
 size = Dimensioni
 
+# Progress footer
+details = Dettagli
+dismiss = Nascondi messaggio
+operations-running = {$running} operazioni in corso ({$percent}%)...
+operations-running-finished = {$running} operazioni in corso ({$percent}%), {$finished} completate...
+pause = Pausa
+resume = Riprendi
+
 # Dialogs
 
 ## Compress Dialog
@@ -189,6 +197,14 @@ default-app = {$name} (default)
 
 ## Show details
 show-details = Mostra dettagli
+type = Tipo: {$mime}
+items = Elementi: {$items}
+item-size = Dimensione: {$size}
+item-created = Creato: {$created}
+item-modified = Modificato: {$modified}
+item-accessed = Ultimo accesso: {$accessed}
+calculating = Calcolando...
+
 
 ## Settings
 settings = Impostazioni

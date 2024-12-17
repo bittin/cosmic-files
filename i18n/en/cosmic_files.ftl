@@ -26,6 +26,14 @@ modified = Modified
 trashed-on = Trashed
 size = Size
 
+# Progress footer
+details = Details
+dismiss = Dismiss message
+operations-running = {$running} operations running ({$percent}%)...
+operations-running-finished = {$running} operations running ({$percent}%), {$finished} finished...
+pause = Pause
+resume = Resume
+
 # Dialogs
 
 ## Compress Dialog
@@ -126,16 +134,20 @@ try-again = Try again
 username = Username
 
 ## Operations
+cancelled = Cancelled
 edit-history = Edit history
 history = History
 no-history = No items in history.
 pending = Pending
+progress = {$percent}%
+progress-cancelled = {$percent}%, cancelled
+progress-paused = {$percent}%, paused
 failed = Failed
 complete = Complete
 compressing = Compressing {$items} {$items ->
         [one] item
         *[other] items
-    } from "{$from}" to "{$to}"
+    } from "{$from}" to "{$to}" ({$progress})...
 compressed = Compressed {$items} {$items ->
         [one] item
         *[other] items
@@ -146,17 +158,17 @@ created = Created "{$name}" in "{$parent}"
 copying = Copying {$items} {$items ->
         [one] item
         *[other] items
-    } from "{$from}" to "{$to}"
+    } from "{$from}" to "{$to}" ({$progress})...
 copied = Copied {$items} {$items ->
         [one] item
         *[other] items
     } from "{$from}" to "{$to}"
-emptying-trash = Emptying {trash}
+emptying-trash = Emptying {trash} ({$progress})...
 emptied-trash = Emptied {trash}
 extracting = Extracting {$items} {$items ->
         [one] item
         *[other] items
-    } from "{$from}" to "{$to}"
+    } from "{$from}" to "{$to}" ({$progress})...
 extracted = Extracted {$items} {$items ->
         [one] item
         *[other] items
@@ -166,7 +178,7 @@ set-executable-and-launched = Set "{$name}" as executable and launched
 moving = Moving {$items} {$items ->
         [one] item
         *[other] items
-    } from "{$from}" to "{$to}"
+    } from "{$from}" to "{$to}" ({$progress})...
 moved = Moved {$items} {$items ->
         [one] item
         *[other] items
@@ -176,7 +188,7 @@ renamed = Renamed "{$from}" to "{$to}"
 restoring = Restoring {$items} {$items ->
         [one] item
         *[other] items
-    } from {trash}
+    } from {trash} ({$progress})...
 restored = Restored {$items} {$items ->
         [one] item
         *[other] items
@@ -189,6 +201,13 @@ default-app = {$name} (default)
 
 ## Show details
 show-details = Show details
+type = Type: {$mime}
+items = Items: {$items}
+item-size = Size: {$size}
+item-created = Created: {$created}
+item-modified = Modified: {$modified}
+item-accessed = Accessed: {$accessed}
+calculating = Calculating...
 
 ## Settings
 settings = Settings

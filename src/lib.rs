@@ -17,7 +17,7 @@ mod mime_app;
 pub mod mime_icon;
 mod mounter;
 mod mouse_area;
-mod operation;
+pub mod operation;
 mod spawn_detached;
 use tab::Location;
 pub mod tab;
@@ -68,11 +68,12 @@ pub fn desktop() -> Result<(), Box<dyn std::error::Error>> {
         settings = settings.no_main_window(true);
     }
 
+    let locations = vec![tab::Location::Desktop(desktop_dir(), String::new(), config.desktop)];
     let flags = Flags {
         config_handler,
         config,
         mode: app::Mode::Desktop,
-        locations: vec![tab::Location::Path(desktop_dir())],
+        locations,
     };
     cosmic::app::run::<App>(settings, flags)?;
 
@@ -82,25 +83,19 @@ pub fn desktop() -> Result<(), Box<dyn std::error::Error>> {
 /// Runs application with these settings
 #[rustfmt::skip]
 pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(all(unix, not(target_os = "redox")))]
-    match fork::daemon(true, true) {
-        Ok(fork::Fork::Child) => (),
-        Ok(fork::Fork::Parent(_child_pid)) => process::exit(0),
-        Err(err) => {
-            eprintln!("failed to daemonize: {:?}", err);
-            process::exit(1);
-        }
-    }
-
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     localize::localize();
 
     let (config_handler, config) = Config::load();
 
+    let mut daemonize = true;
     let mut locations = Vec::new();
     for arg in env::args().skip(1) {
-        let location = if &arg == "--trash" {
+        let location = if &arg == "--no-daemon" {
+            daemonize = false;
+            continue;
+        } else if &arg == "--trash" {
             Location::Trash
         } else {
             match fs::canonicalize(&arg) {
@@ -112,6 +107,18 @@ pub fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         locations.push(location);
+    }
+
+    if daemonize {
+        #[cfg(all(unix, not(target_os = "redox")))]
+        match fork::daemon(true, true) {
+            Ok(fork::Fork::Child) => (),
+            Ok(fork::Fork::Parent(_child_pid)) => process::exit(0),
+            Err(err) => {
+                eprintln!("failed to daemonize: {:?}", err);
+                process::exit(1);
+            }
+        }
     }
 
     let mut settings = Settings::default();

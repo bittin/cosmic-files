@@ -3,7 +3,7 @@
 
 #[cfg(feature = "wayland")]
 use cosmic::iced::{
-    event::wayland::{Event as WaylandEvent, OutputEvent},
+    event::wayland::{Event as WaylandEvent, OutputEvent, OverlapNotifyEvent},
     platform_specific::runtime::wayland::layer_surface::{
         IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
     },
@@ -12,8 +12,10 @@ use cosmic::iced::{
     },
     Limits,
 };
+#[cfg(feature = "wayland")]
+use cosmic::iced_winit::commands::overlap_notify::overlap_notify;
 use cosmic::{
-    app::{self, message, Core, Task},
+    app::{self, context_drawer, message, Core, Task},
     cosmic_config, cosmic_theme, executor,
     iced::{
         clipboard::dnd::DndAction,
@@ -21,17 +23,18 @@ use cosmic::{
         futures::{self, SinkExt},
         keyboard::{Event as KeyEvent, Key, Modifiers},
         stream,
-        widget::scrollable,
         window::{self, Event as WindowEvent, Id as WindowId},
-        Alignment, Event, Length, Size, Subscription,
+        Alignment, Event, Length, Point, Rectangle, Size, Subscription,
     },
     iced_runtime::clipboard,
     style, theme,
     widget::{
         self,
         dnd_destination::DragId,
+        horizontal_space,
         menu::{action::MenuAction, key_bind::KeyBind},
         segmented_button::{self, Entity},
+        vertical_space,
     },
     Application, ApplicationExt, Element,
 };
@@ -43,7 +46,7 @@ use notify_debouncer_full::{
 use slotmap::Key as SlotMapKey;
 use std::{
     any::TypeId,
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     env, fmt, fs, io,
     num::NonZeroU16,
     path::PathBuf,
@@ -64,7 +67,7 @@ use crate::{
     localize::LANGUAGE_SORTER,
     menu, mime_app, mime_icon,
     mounter::{MounterAuth, MounterItem, MounterItems, MounterKey, MounterMessage, MOUNTERS},
-    operation::{Operation, ReplaceResult},
+    operation::{Controller, Operation, OperationSelection, ReplaceResult},
     spawn_detached::spawn_detached,
     tab::{self, HeadingOptions, ItemMetadata, Location, Tab, HOVER_DURATION},
 };
@@ -97,6 +100,7 @@ pub enum Action {
     EditHistory,
     EditLocation,
     EmptyTrash,
+    #[cfg(feature = "desktop")]
     ExecEntryAction(usize),
     ExtractHere,
     Gallery,
@@ -159,6 +163,7 @@ impl Action {
             }
             Action::EmptyTrash => Message::TabMessage(None, tab::Message::EmptyTrash),
             Action::ExtractHere => Message::ExtractHere(entity_opt),
+            #[cfg(feature = "desktop")]
             Action::ExecEntryAction(action) => {
                 Message::TabMessage(entity_opt, tab::Message::ExecEntryAction(None, *action))
             }
@@ -302,11 +307,17 @@ pub enum Message {
     OpenWithBrowse,
     OpenWithDialog(Option<Entity>),
     OpenWithSelection(usize),
+    #[cfg(all(feature = "desktop", feature = "wayland"))]
+    Overlap(OverlapNotifyEvent, window::Id),
     Paste(Option<Entity>),
     PasteContents(PathBuf, ClipboardPaste),
-    PendingComplete(u64),
+    PendingCancel(u64),
+    PendingCancelAll,
+    PendingComplete(u64, OperationSelection),
+    PendingDismiss,
     PendingError(u64, String),
-    PendingProgress(u64, f32),
+    PendingPause(u64, bool),
+    PendingPauseAll(bool),
     Preview(Option<Entity>),
     RescanTrash,
     Rename(Option<Entity>),
@@ -315,7 +326,9 @@ pub enum Message {
     SearchActivate,
     SearchClear,
     SearchInput(String),
+    SetShowDetails(bool),
     SystemThemeModeChange(cosmic_theme::ThemeMode),
+    Size(Size),
     TabActivate(Entity),
     TabNext,
     TabPrev,
@@ -328,7 +341,7 @@ pub enum Message {
         Location,
         Option<tab::Item>,
         Vec<tab::Item>,
-        Option<PathBuf>,
+        Option<Vec<PathBuf>>,
     ),
     TabView(Option<Entity>, tab::View),
     ToggleContextPage(ContextPage),
@@ -364,18 +377,6 @@ pub enum ContextPage {
     NetworkDrive,
     Preview(Option<Entity>, PreviewKind),
     Settings,
-}
-
-impl ContextPage {
-    pub fn title(&self) -> String {
-        match self {
-            Self::About => String::new(),
-            Self::EditHistory => fl!("edit-history"),
-            Self::NetworkDrive => fl!("add-network-drive"),
-            Self::Preview(..) => String::default(),
-            Self::Settings => fl!("settings"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -507,17 +508,21 @@ pub struct App {
     dialog_pages: VecDeque<DialogPage>,
     dialog_text_input: widget::Id,
     key_binds: HashMap<KeyBind, Action>,
+    margin: HashMap<window::Id, (f32, f32, f32, f32)>,
     modifiers: Modifiers,
     mounter_items: HashMap<MounterKey, MounterItems>,
     network_drive_connecting: Option<(MounterKey, String)>,
     network_drive_input: String,
     #[cfg(feature = "notify")]
     notification_opt: Option<Arc<Mutex<notify_rust::NotificationHandle>>>,
+    overlap: HashMap<String, (window::Id, Rectangle)>,
     pending_operation_id: u64,
-    pending_operations: BTreeMap<u64, (Operation, f32)>,
+    pending_operations: BTreeMap<u64, (Operation, Controller)>,
+    progress_operations: BTreeSet<u64>,
     complete_operations: BTreeMap<u64, Operation>,
-    failed_operations: BTreeMap<u64, (Operation, String)>,
+    failed_operations: BTreeMap<u64, (Operation, Controller, String)>,
     search_id: widget::Id,
+    size: Option<Size>,
     #[cfg(feature = "wayland")]
     surface_ids: HashMap<WlOutput, WindowId>,
     #[cfg(feature = "wayland")]
@@ -618,6 +623,7 @@ impl App {
         }
     }
 
+    #[cfg(feature = "desktop")]
     fn exec_entry_action(entry: cosmic::desktop::DesktopEntryData, action: usize) {
         if let Some(action) = entry.desktop_actions.get(action) {
             // Largely copied from COSMIC app library
@@ -642,11 +648,103 @@ impl App {
         }
     }
 
+    fn handle_overlap(&mut self) {
+        let Some((bl, br, tl, tr, mut size)) = self.size.as_ref().map(|s| {
+            (
+                Rectangle::new(
+                    Point::new(0., s.height / 2.),
+                    Size::new(s.width / 2., s.height / 2.),
+                ),
+                Rectangle::new(
+                    Point::new(s.width / 2., s.height / 2.),
+                    Size::new(s.width / 2., s.height / 2.),
+                ),
+                Rectangle::new(Point::new(0., 0.), Size::new(s.width / 2., s.height / 2.)),
+                Rectangle::new(
+                    Point::new(s.width / 2., 0.),
+                    Size::new(s.width / 2., s.height / 2.),
+                ),
+                *s,
+            )
+        }) else {
+            return;
+        };
+
+        let mut overlaps: HashMap<_, _> = self
+            .windows
+            .keys()
+            .into_iter()
+            .map(|k| (*k, (0., 0., 0., 0.)))
+            .collect();
+        let mut sorted_overlaps: Vec<_> = self.overlap.values().collect();
+        sorted_overlaps
+            .sort_by(|a, b| (b.1.width * b.1.height).total_cmp(&(a.1.width * b.1.height)));
+
+        for (w_id, overlap) in sorted_overlaps {
+            let tl = tl.intersects(overlap);
+            let tr = tr.intersects(overlap);
+            let bl = bl.intersects(overlap);
+            let br = br.intersects(overlap);
+            let Some((top, left, bottom, right)) = overlaps.get_mut(&w_id) else {
+                continue;
+            };
+            if tl && tr {
+                *top += overlap.height;
+            }
+            if tl && bl {
+                *left += overlap.width;
+            }
+            if bl && br {
+                *bottom += overlap.height;
+            }
+            if tr && br {
+                *right += overlap.width;
+            }
+
+            let min_dim =
+                if overlap.width / size.width.max(1.) > overlap.height / size.height.max(1.) {
+                    (0., overlap.height)
+                } else {
+                    (overlap.width, 0.)
+                };
+            // just one quadrant with overlap
+            if tl && !(tr || bl) {
+                *top += min_dim.1;
+                *left += min_dim.0;
+
+                size.height -= min_dim.1;
+                size.width -= min_dim.0;
+            }
+            if tr && !(tl || br) {
+                *top += min_dim.1;
+                *right += min_dim.0;
+
+                size.height -= min_dim.1;
+                size.width -= min_dim.0;
+            }
+            if bl && !(br || tl) {
+                *bottom += min_dim.1;
+                *left += min_dim.0;
+
+                size.height -= min_dim.1;
+                size.width -= min_dim.0;
+            }
+            if br && !(bl || tr) {
+                *bottom += min_dim.1;
+                *right += min_dim.0;
+
+                size.height -= min_dim.1;
+                size.width -= min_dim.0;
+            }
+        }
+        self.margin = overlaps;
+    }
+
     fn open_tab_entity(
         &mut self,
         location: Location,
         activate: bool,
-        selection_path: Option<PathBuf>,
+        selection_paths: Option<Vec<PathBuf>>,
     ) -> (Entity, Task<Message>) {
         let mut tab = Tab::new(location.clone(), self.config.tab);
         tab.mode = match self.mode {
@@ -674,7 +772,7 @@ impl App {
             Task::batch([
                 self.update_title(),
                 self.update_watcher(),
-                self.rescan_tab(entity, location, selection_path),
+                self.rescan_tab(entity, location, selection_paths),
             ]),
         )
     }
@@ -683,15 +781,19 @@ impl App {
         &mut self,
         location: Location,
         activate: bool,
-        selection_path: Option<PathBuf>,
+        selection_paths: Option<Vec<PathBuf>>,
     ) -> Task<Message> {
-        self.open_tab_entity(location, activate, selection_path).1
+        self.open_tab_entity(location, activate, selection_paths).1
     }
 
     fn operation(&mut self, operation: Operation) {
         let id = self.pending_operation_id;
         self.pending_operation_id += 1;
-        self.pending_operations.insert(id, (operation, 0.0));
+        if operation.show_progress_notification() {
+            self.progress_operations.insert(id);
+        }
+        self.pending_operations
+            .insert(id, (operation, Controller::new()));
     }
 
     fn remove_window(&mut self, id: &window::Id) {
@@ -704,13 +806,38 @@ impl App {
         }
     }
 
+    fn rescan_operation_selection(&mut self, op_sel: OperationSelection) -> Task<Message> {
+        log::info!("rescan_operation_selection {:?}", op_sel);
+        let entity = self.tab_model.active();
+        let Some(tab) = self.tab_model.data::<Tab>(entity) else {
+            return Task::none();
+        };
+        let Some(ref items) = tab.items_opt() else {
+            return Task::none();
+        };
+        for item in items.iter() {
+            if item.selected {
+                if let Some(path) = item.path_opt() {
+                    if op_sel.selected.contains(path) || op_sel.ignored.contains(path) {
+                        // Ignore if path in selected or ignored paths
+                        continue;
+                    }
+                }
+
+                // Return if there is a previous selection not matching
+                return Task::none();
+            }
+        }
+        self.rescan_tab(entity, tab.location.clone(), Some(op_sel.selected))
+    }
+
     fn rescan_tab(
         &mut self,
         entity: Entity,
         location: Location,
-        selection_path: Option<PathBuf>,
+        selection_paths: Option<Vec<PathBuf>>,
     ) -> Task<Message> {
-        log::info!("rescan_tab {entity:?} {location:?} {selection_path:?}");
+        log::info!("rescan_tab {entity:?} {location:?} {selection_paths:?}");
         let icon_sizes = self.config.tab.icon_sizes;
         Task::perform(
             async move {
@@ -721,7 +848,7 @@ impl App {
                         location,
                         parent_item_opt,
                         items,
-                        selection_path,
+                        selection_paths,
                     )),
                     Err(err) => {
                         log::warn!("failed to rescan: {}", err);
@@ -845,13 +972,19 @@ impl App {
         let mut needs_reload = Vec::new();
         for entity in self.tab_model.iter() {
             if let Some(tab) = self.tab_model.data::<Tab>(entity) {
-                if let Location::Desktop(..) = &tab.location {
-                    needs_reload.push((entity, tab.location.clone()));
+                if let Location::Desktop(path, output, _) = &tab.location {
+                    needs_reload.push((
+                        entity,
+                        Location::Desktop(path.clone(), output.clone(), self.config.desktop),
+                    ));
                 };
             }
         }
         let mut commands = Vec::with_capacity(needs_reload.len());
         for (entity, location) in needs_reload {
+            if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
+                tab.location = location.clone();
+            }
             commands.push(self.rescan_tab(entity, location, None));
         }
         Task::batch(commands)
@@ -1092,16 +1225,6 @@ impl App {
         let cosmic_theme::Spacing {
             space_xxs, space_m, ..
         } = theme::active().cosmic().spacing;
-        let mut text_input =
-            widget::text_input(fl!("enter-server-address"), &self.network_drive_input);
-        let button = if self.network_drive_connecting.is_some() {
-            widget::button::standard(fl!("connecting"))
-        } else {
-            text_input = text_input
-                .on_input(Message::NetworkDriveInput)
-                .on_submit(Message::NetworkDriveSubmit);
-            widget::button::standard(fl!("connect")).on_press(Message::NetworkDriveSubmit)
-        };
         let mut table = widget::column::with_capacity(8);
         for (i, line) in fl!("network-drive-schemes").lines().enumerate() {
             let mut row = widget::row::with_capacity(2);
@@ -1122,17 +1245,15 @@ impl App {
             }
         }
         widget::column::with_children(vec![
-            text_input.into(),
-            widget::text(fl!("network-drive-description")).into(),
+            widget::text::body(fl!("network-drive-description")).into(),
             table.into(),
-            widget::row::with_children(vec![widget::horizontal_space().into(), button.into()])
-                .into(),
         ])
         .spacing(space_m)
         .into()
     }
 
     fn desktop_view_options(&self) -> Element<Message> {
+        let cosmic_theme::Spacing { space_l, .. } = theme::active().cosmic().spacing;
         let config = self.config.desktop;
 
         let mut children = Vec::new();
@@ -1195,10 +1316,14 @@ impl App {
         children.push(section.into());
         */
 
-        widget::settings::view_column(children).into()
+        widget::column::with_children(children)
+            .padding([0, space_l, space_l, space_l])
+            .into()
     }
 
     fn edit_history(&self) -> Element<Message> {
+        let cosmic_theme::Spacing { space_m, .. } = theme::active().cosmic().spacing;
+
         let mut children = Vec::new();
 
         //TODO: get height from theme?
@@ -1206,12 +1331,48 @@ impl App {
 
         if !self.pending_operations.is_empty() {
             let mut section = widget::settings::section().title(fl!("pending"));
-            for (_id, (op, progress)) in self.pending_operations.iter().rev() {
+            for (id, (op, controller)) in self.pending_operations.iter().rev() {
+                let progress = controller.progress();
                 section = section.add(widget::column::with_children(vec![
-                    widget::text(op.pending_text()).into(),
-                    widget::progress_bar(0.0..=100.0, *progress)
-                        .height(progress_bar_height)
+                    widget::row::with_children(vec![
+                        widget::progress_bar(0.0..=1.0, progress)
+                            .height(progress_bar_height)
+                            .into(),
+                        if controller.is_paused() {
+                            widget::tooltip(
+                                widget::button::icon(widget::icon::from_name(
+                                    "media-playback-start-symbolic",
+                                ))
+                                .on_press(Message::PendingPause(*id, false))
+                                .padding(8),
+                                widget::text::body(fl!("resume")),
+                                widget::tooltip::Position::Top,
+                            )
+                            .into()
+                        } else {
+                            widget::tooltip(
+                                widget::button::icon(widget::icon::from_name(
+                                    "media-playback-pause-symbolic",
+                                ))
+                                .on_press(Message::PendingPause(*id, true))
+                                .padding(8),
+                                widget::text::body(fl!("pause")),
+                                widget::tooltip::Position::Top,
+                            )
+                            .into()
+                        },
+                        widget::tooltip(
+                            widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+                                .on_press(Message::PendingCancel(*id))
+                                .padding(8),
+                            widget::text::body(fl!("cancel")),
+                            widget::tooltip::Position::Top,
+                        )
                         .into(),
+                    ])
+                    .align_y(Alignment::Center)
+                    .into(),
+                    widget::text::body(op.pending_text(progress, controller.state())).into(),
                 ]));
             }
             children.push(section.into());
@@ -1219,10 +1380,11 @@ impl App {
 
         if !self.failed_operations.is_empty() {
             let mut section = widget::settings::section().title(fl!("failed"));
-            for (_id, (op, error)) in self.failed_operations.iter().rev() {
+            for (_id, (op, controller, error)) in self.failed_operations.iter().rev() {
+                let progress = controller.progress();
                 section = section.add(widget::column::with_children(vec![
-                    widget::text(op.pending_text()).into(),
-                    widget::text(error).into(),
+                    widget::text::body(op.pending_text(progress, controller.state())).into(),
+                    widget::text::body(error).into(),
                 ]));
             }
             children.push(section.into());
@@ -1231,7 +1393,7 @@ impl App {
         if !self.complete_operations.is_empty() {
             let mut section = widget::settings::section().title(fl!("complete"));
             for (_id, op) in self.complete_operations.iter().rev() {
-                section = section.add(widget::text(op.completed_text()));
+                section = section.add(widget::text::body(op.completed_text()));
             }
             children.push(section.into());
         }
@@ -1240,7 +1402,9 @@ impl App {
             children.push(widget::text::body(fl!("no-history")).into());
         }
 
-        widget::settings::view_column(children).into()
+        widget::column::with_children(children)
+            .spacing(space_m)
+            .into()
     }
 
     fn preview<'a>(
@@ -1249,19 +1413,20 @@ impl App {
         kind: &'a PreviewKind,
         context_drawer: bool,
     ) -> Element<'a, Message> {
+        let cosmic_theme::Spacing { space_l, .. } = theme::active().cosmic().spacing;
+
         let mut children = Vec::with_capacity(1);
         let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
         match kind {
             PreviewKind::Custom(PreviewItem(item)) => {
-                children.push(item.preview_view(IconSizes::default(), context_drawer));
+                children.push(item.preview_view(IconSizes::default()));
             }
             PreviewKind::Location(location) => {
                 if let Some(tab) = self.tab_model.data::<Tab>(entity) {
                     if let Some(items) = tab.items_opt() {
                         for item in items.iter() {
                             if item.location_opt.as_ref() == Some(location) {
-                                children
-                                    .push(item.preview_view(tab.config.icon_sizes, context_drawer));
+                                children.push(item.preview_view(tab.config.icon_sizes));
                                 // Only show one property view to avoid issues like hangs when generating
                                 // preview images on thousands of files
                                 break;
@@ -1275,8 +1440,7 @@ impl App {
                     if let Some(items) = tab.items_opt() {
                         for item in items.iter() {
                             if item.selected {
-                                children
-                                    .push(item.preview_view(tab.config.icon_sizes, context_drawer));
+                                children.push(item.preview_view(tab.config.icon_sizes));
                                 // Only show one property view to avoid issues like hangs when generating
                                 // preview images on thousands of files
                                 break;
@@ -1284,26 +1448,25 @@ impl App {
                         }
                         if children.is_empty() {
                             if let Some(item) = &tab.parent_item_opt {
-                                children
-                                    .push(item.preview_view(tab.config.icon_sizes, context_drawer));
+                                children.push(item.preview_view(tab.config.icon_sizes));
                             }
                         }
                     }
                 }
             }
         }
-
-        // View column has extra padding not wanted when not showing in context drawer
-        if context_drawer {
-            widget::settings::view_column(children).into()
-        } else {
-            widget::column::with_children(children).into()
-        }
+        widget::column::with_children(children)
+            .padding(if context_drawer {
+                [0, 0, 0, 0]
+            } else {
+                [0, space_l, space_l, space_l]
+            })
+            .into()
     }
 
     fn settings(&self) -> Element<Message> {
         // TODO: Should dialog be updated here too?
-        widget::settings::view_column(vec![widget::settings::section()
+        widget::column::with_children(vec![widget::settings::section()
             .title(fl!("appearance"))
             .add({
                 let app_theme_selected = match self.config.app_theme {
@@ -1390,17 +1553,21 @@ impl Application for App {
             dialog_pages: VecDeque::new(),
             dialog_text_input: widget::Id::unique(),
             key_binds,
+            margin: HashMap::new(),
             modifiers: Modifiers::empty(),
             mounter_items: HashMap::new(),
             network_drive_connecting: None,
             network_drive_input: String::new(),
             #[cfg(feature = "notify")]
             notification_opt: None,
+            overlap: HashMap::new(),
             pending_operation_id: 0,
             pending_operations: BTreeMap::new(),
+            progress_operations: BTreeSet::new(),
             complete_operations: BTreeMap::new(),
             failed_operations: BTreeMap::new(),
             search_id: widget::Id::unique(),
+            size: None,
             #[cfg(feature = "wayland")]
             surface_ids: HashMap::new(),
             #[cfg(feature = "wayland")]
@@ -1486,37 +1653,44 @@ impl Application for App {
         {
             items.push(cosmic::widget::menu::Item::Button(
                 fl!("open"),
+                None,
                 NavMenuAction::Open(entity),
             ));
             items.push(cosmic::widget::menu::Item::Button(
                 fl!("open-with"),
+                None,
                 NavMenuAction::OpenWith(entity),
             ));
         } else {
             items.push(cosmic::widget::menu::Item::Button(
                 fl!("open-in-new-tab"),
+                None,
                 NavMenuAction::OpenInNewTab(entity),
             ));
             items.push(cosmic::widget::menu::Item::Button(
                 fl!("open-in-new-window"),
+                None,
                 NavMenuAction::OpenInNewWindow(entity),
             ));
         }
         items.push(cosmic::widget::menu::Item::Divider);
         items.push(cosmic::widget::menu::Item::Button(
             fl!("show-details"),
+            None,
             NavMenuAction::Preview(entity),
         ));
         items.push(cosmic::widget::menu::Item::Divider);
         if favorite_index_opt.is_some() {
             items.push(cosmic::widget::menu::Item::Button(
                 fl!("remove-from-sidebar"),
+                None,
                 NavMenuAction::RemoveFromSidebar(entity),
             ));
         }
         if matches!(location_opt, Some(Location::Trash)) {
             items.push(cosmic::widget::menu::Item::Button(
                 fl!("empty-trash"),
+                None,
                 NavMenuAction::EmptyTrash,
             ));
         }
@@ -1589,7 +1763,7 @@ impl Application for App {
         // of closing everything on one press
         if self.core.window.show_context {
             self.set_show_context(false);
-            return Task::none();
+            return cosmic::task::message(app::Message::App(Message::SetShowDetails(false)));
         }
         if self.search_get().is_some() {
             // Close search if open
@@ -2211,7 +2385,7 @@ impl Application for App {
                             Some(self.open_tab(
                                 Location::Path(parent.to_path_buf()),
                                 true,
-                                Some(path),
+                                Some(vec![path]),
                             ))
                         } else {
                             None
@@ -2308,41 +2482,29 @@ impl Application for App {
                             });
                         }
                         ClipboardKind::Cut => {
-                            //TODO: determine ability to move on non-Unix systems
-                            let mut can_move = true;
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::MetadataExt;
-                                //TODO: better error handling, fall back to not moving?
-                                if let Ok(to_meta) = fs::metadata(&to) {
-                                    for path in contents.paths.iter() {
-                                        if let Ok(meta) = fs::metadata(path) {
-                                            if meta.dev() != to_meta.dev() {
-                                                can_move = false;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if can_move {
-                                self.operation(Operation::Move {
-                                    paths: contents.paths,
-                                    to,
-                                });
-                            } else {
-                                self.operation(Operation::Copy {
-                                    paths: contents.paths,
-                                    to,
-                                });
-                            }
+                            self.operation(Operation::Move {
+                                paths: contents.paths,
+                                to,
+                            });
                         }
                     }
                 }
             }
-            Message::PendingComplete(id) => {
-                let mut commands = Vec::with_capacity(3);
-
+            Message::PendingCancel(id) => {
+                if let Some((_, controller)) = self.pending_operations.get(&id) {
+                    controller.cancel();
+                    self.progress_operations.remove(&id);
+                }
+            }
+            Message::PendingCancelAll => {
+                for (id, (_, controller)) in self.pending_operations.iter() {
+                    controller.cancel();
+                    self.progress_operations.remove(&id);
+                }
+            }
+            Message::PendingComplete(id, op_sel) => {
+                let mut commands = Vec::with_capacity(4);
+                // Show toast for some operations
                 if let Some((op, _)) = self.pending_operations.remove(&id) {
                     if let Some(description) = op.toast() {
                         if let Operation::Delete { ref paths } = op {
@@ -2361,27 +2523,65 @@ impl Application for App {
                     }
                     self.complete_operations.insert(id, op);
                 }
+                // Close progress notification if all relavent operations are finished
+                if !self
+                    .pending_operations
+                    .iter()
+                    .any(|(_id, (op, _))| op.show_progress_notification())
+                {
+                    self.progress_operations.clear();
+                }
                 // Potentially show a notification
                 commands.push(self.update_notification());
+                // Rescan and select based on operation
+                commands.push(self.rescan_operation_selection(op_sel));
                 // Manually rescan any trash tabs after any operation is completed
                 commands.push(self.rescan_trash());
                 // if search is active, update "search" tab view
                 commands.push(self.search());
                 return Task::batch(commands);
             }
+            Message::PendingDismiss => {
+                self.progress_operations.clear();
+            }
             Message::PendingError(id, err) => {
-                if let Some((op, _)) = self.pending_operations.remove(&id) {
-                    self.failed_operations.insert(id, (op, err));
-                    self.dialog_pages.push_back(DialogPage::FailedOperation(id));
+                if let Some((op, controller)) = self.pending_operations.remove(&id) {
+                    // Only show dialog if not cancelled
+                    if !controller.is_cancelled() {
+                        self.dialog_pages.push_back(DialogPage::FailedOperation(id));
+                    }
+                    // Remove from progress
+                    self.progress_operations.remove(&id);
+                    self.failed_operations.insert(id, (op, controller, err));
+                }
+                // Close progress notification if all relavent operations are finished
+                if !self
+                    .pending_operations
+                    .iter()
+                    .any(|(_id, (op, _))| op.show_progress_notification())
+                {
+                    self.progress_operations.clear();
                 }
                 // Manually rescan any trash tabs after any operation is completed
                 return self.rescan_trash();
             }
-            Message::PendingProgress(id, new_progress) => {
-                if let Some((_, progress)) = self.pending_operations.get_mut(&id) {
-                    *progress = new_progress;
+            Message::PendingPause(id, pause) => {
+                if let Some((_, controller)) = self.pending_operations.get(&id) {
+                    if pause {
+                        controller.pause();
+                    } else {
+                        controller.unpause();
+                    }
                 }
-                return self.update_notification();
+            }
+            Message::PendingPauseAll(pause) => {
+                for (_id, (_, controller)) in self.pending_operations.iter() {
+                    if pause {
+                        controller.pause();
+                    } else {
+                        controller.unpause();
+                    }
+                }
             }
             Message::Preview(entity_opt) => {
                 match self.mode {
@@ -2495,7 +2695,7 @@ impl Application for App {
                 }
             }
             Message::RestoreFromTrash(entity_opt) => {
-                let mut paths = Vec::new();
+                let mut trash_items = Vec::new();
                 let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
                 if let Some(tab) = self.tab_model.data_mut::<Tab>(entity) {
                     if let Some(items) = tab.items_opt() {
@@ -2503,7 +2703,7 @@ impl Application for App {
                             if item.selected {
                                 match &item.metadata {
                                     ItemMetadata::Trash { entry, .. } => {
-                                        paths.push(entry.clone());
+                                        trash_items.push(entry.clone());
                                     }
                                     _ => {
                                         //TODO: error on trying to restore non-trash file?
@@ -2513,8 +2713,8 @@ impl Application for App {
                         }
                     }
                 }
-                if !paths.is_empty() {
-                    self.operation(Operation::Restore { paths });
+                if !trash_items.is_empty() {
+                    self.operation(Operation::Restore { items: trash_items });
                 }
             }
             Message::SearchActivate => {
@@ -2529,6 +2729,10 @@ impl Application for App {
             }
             Message::SearchInput(input) => {
                 return self.search_set(Some(input));
+            }
+            Message::SetShowDetails(show_details) => {
+                config_set!(show_details, show_details);
+                return self.update_config();
             }
             Message::SystemThemeModeChange(_theme_mode) => {
                 return self.update_config();
@@ -2640,7 +2844,6 @@ impl Application for App {
                         tab::Command::AddNetworkDrive => {
                             self.context_page = ContextPage::NetworkDrive;
                             self.set_show_context(true);
-                            self.set_context_title(self.context_page.title());
                         }
                         tab::Command::AddToSidebar(path) => {
                             let mut favorites = self.config.favorites.clone();
@@ -2651,14 +2854,14 @@ impl Application for App {
                             config_set!(favorites, favorites);
                             commands.push(self.update_config());
                         }
-                        tab::Command::ChangeLocation(tab_title, tab_path, selection_path) => {
+                        tab::Command::ChangeLocation(tab_title, tab_path, selection_paths) => {
                             self.activate_nav_model_location(&tab_path);
 
                             self.tab_model.text_set(entity, tab_title);
                             commands.push(Task::batch([
                                 self.update_title(),
                                 self.update_watcher(),
-                                self.rescan_tab(entity, tab_path, selection_path),
+                                self.rescan_tab(entity, tab_path, selection_paths),
                             ]));
                         }
                         tab::Command::DropFiles(to, from) => {
@@ -2667,6 +2870,7 @@ impl Application for App {
                         tab::Command::EmptyTrash => {
                             self.dialog_pages.push_back(DialogPage::EmptyTrash);
                         }
+                        #[cfg(feature = "desktop")]
                         tab::Command::ExecEntryAction(entry, action) => {
                             App::exec_entry_action(entry, action);
                         }
@@ -2707,7 +2911,6 @@ impl Application for App {
                         tab::Command::Preview(kind) => {
                             self.context_page = ContextPage::Preview(Some(entity), kind);
                             self.set_show_context(true);
-                            self.set_context_title(self.context_page.title());
                         }
                         tab::Command::WindowDrag => {
                             if let Some(window_id) = &self.window_id_opt {
@@ -2731,14 +2934,14 @@ impl Application for App {
                 };
                 return self.open_tab(location, true, None);
             }
-            Message::TabRescan(entity, location, parent_item_opt, items, selection_path) => {
+            Message::TabRescan(entity, location, parent_item_opt, items, selection_paths) => {
                 match self.tab_model.data_mut::<Tab>(entity) {
                     Some(tab) => {
                         if location == tab.location {
                             tab.parent_item_opt = parent_item_opt;
                             tab.set_items(items);
-                            if let Some(selection_path) = selection_path {
-                                tab.select_path(selection_path);
+                            if let Some(selection_paths) = selection_paths {
+                                tab.select_paths(selection_paths);
                             }
                         }
                     }
@@ -2762,7 +2965,6 @@ impl Application for App {
                     self.set_show_context(true);
                 }
                 self.context_page = context_page;
-                self.set_context_title(self.context_page.title());
             }
             Message::Undo(_id) => {
                 // TODO: undo
@@ -2773,7 +2975,7 @@ impl Application for App {
                 let mut paths = Vec::with_capacity(recently_trashed.len());
                 let icon_sizes = self.config.tab.icon_sizes;
 
-                return cosmic::command::future(async move {
+                return cosmic::task::future(async move {
                     match tokio::task::spawn_blocking(move || Location::Trash.scan(icon_sizes))
                         .await
                     {
@@ -2797,8 +2999,8 @@ impl Application for App {
                     Message::UndoTrashStart(paths)
                 });
             }
-            Message::UndoTrashStart(paths) => {
-                self.operation(Operation::Restore { paths });
+            Message::UndoTrashStart(items) => {
+                self.operation(Operation::Restore { items });
             }
             Message::WindowClose => {
                 if let Some(window_id) = self.window_id_opt.take() {
@@ -3098,7 +3300,6 @@ impl Application for App {
                                     PreviewKind::Custom(PreviewItem(item)),
                                 );
                                 self.set_show_context(true);
-                                self.set_context_title(self.context_page.title());
                             }
                             Err(err) => {
                                 log::warn!("failed to get item from path {:?}: {}", path, err);
@@ -3184,9 +3385,11 @@ impl Application for App {
                                     left: 0,
                                     right: 0,
                                 },
-                                exclusive_zone: -1,
+                                exclusive_zone: 0,
                                 size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
                             }),
+                            #[cfg(feature = "wayland")]
+                            overlap_notify(surface_id, true),
                         ]);
                     }
                     OutputEvent::Removed => {
@@ -3212,22 +3415,98 @@ impl Application for App {
                 return Task::perform(async move { cosmic }, |cosmic| message::cosmic(cosmic));
             }
             Message::None => {}
+            #[cfg(all(feature = "desktop", feature = "wayland"))]
+            Message::Overlap(overlap_notify_event, w_id) => match overlap_notify_event {
+                OverlapNotifyEvent::OverlapLayerAdd {
+                    identifier,
+                    namespace,
+                    logical_rect,
+                    exclusive,
+                    ..
+                } => {
+                    if exclusive > 0 || namespace == "Dock" || namespace == "Panel" {
+                        self.overlap.insert(identifier, (w_id, logical_rect));
+                        self.handle_overlap();
+                    }
+                }
+                OverlapNotifyEvent::OverlapLayerRemove { identifier } => {
+                    self.overlap.remove(&identifier);
+                    self.handle_overlap();
+                }
+                _ => {}
+            },
+            Message::Size(size) => {
+                self.size = Some(size);
+                self.handle_overlap();
+            }
         }
 
         Task::none()
     }
 
-    fn context_drawer(&self) -> Option<Element<Message>> {
+    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<Message>> {
         if !self.core.window.show_context {
             return None;
         }
 
         Some(match &self.context_page {
-            ContextPage::About => self.about(),
-            ContextPage::EditHistory => self.edit_history(),
-            ContextPage::NetworkDrive => self.network_drive(),
-            ContextPage::Preview(entity_opt, kind) => self.preview(entity_opt, kind, true),
-            ContextPage::Settings => self.settings(),
+            ContextPage::About => context_drawer::context_drawer(
+                self.about(),
+                Message::ToggleContextPage(ContextPage::About),
+            ),
+            ContextPage::EditHistory => context_drawer::context_drawer(
+                self.edit_history(),
+                Message::ToggleContextPage(ContextPage::EditHistory),
+            )
+            .title(fl!("edit-history")),
+            ContextPage::NetworkDrive => {
+                let mut text_input =
+                    widget::text_input(fl!("enter-server-address"), &self.network_drive_input);
+                let button = if self.network_drive_connecting.is_some() {
+                    widget::button::standard(fl!("connecting"))
+                } else {
+                    text_input = text_input
+                        .on_input(Message::NetworkDriveInput)
+                        .on_submit(Message::NetworkDriveSubmit);
+                    widget::button::standard(fl!("connect")).on_press(Message::NetworkDriveSubmit)
+                };
+                context_drawer::context_drawer(
+                    self.network_drive(),
+                    Message::ToggleContextPage(ContextPage::NetworkDrive),
+                )
+                .title(fl!("add-network-drive"))
+                .header(text_input)
+                .footer(widget::row::with_children(vec![
+                    widget::horizontal_space().into(),
+                    button.into(),
+                ]))
+            }
+            ContextPage::Preview(entity_opt, kind) => {
+                let mut actions = Vec::with_capacity(3);
+                let entity = entity_opt.unwrap_or_else(|| self.tab_model.active());
+                if let Some(tab) = self.tab_model.data::<Tab>(entity) {
+                    if let Some(items) = tab.items_opt() {
+                        for item in items.iter() {
+                            if item.selected {
+                                actions.extend(item.preview_header())
+                            }
+                        }
+                    }
+                };
+                context_drawer::context_drawer(
+                    self.preview(entity_opt, kind, true),
+                    Message::ToggleContextPage(ContextPage::Preview(
+                        entity_opt.clone(),
+                        kind.clone(),
+                    )),
+                )
+                .header_actions(actions)
+            }
+            ContextPage::Settings => context_drawer::context_drawer(
+                self.settings(),
+                Message::ToggleContextPage(ContextPage::Settings),
+            )
+            .title(fl!("settings")),
         })
     }
 
@@ -3259,7 +3538,7 @@ impl Application for App {
                 name,
                 archive_type,
             } => {
-                let mut dialog = widget::dialog(fl!("create-archive"));
+                let mut dialog = widget::dialog().title(fl!("create-archive"));
 
                 let complete_maybe = if name.is_empty() {
                     None
@@ -3331,7 +3610,8 @@ impl Application for App {
                         .spacing(space_xxs),
                     )
             }
-            DialogPage::EmptyTrash => widget::dialog(fl!("empty-trash"))
+            DialogPage::EmptyTrash => widget::dialog()
+                .title(fl!("empty-trash"))
                 .body(fl!("empty-trash-warning"))
                 .primary_action(
                     widget::button::suggested(fl!("empty-trash")).on_press(Message::DialogComplete),
@@ -3341,10 +3621,11 @@ impl Application for App {
                 ),
             DialogPage::FailedOperation(id) => {
                 //TODO: try next dialog page (making sure index is used by Dialog messages)?
-                let (operation, err) = self.failed_operations.get(id)?;
+                let (operation, _, err) = self.failed_operations.get(id)?;
 
                 //TODO: nice description of error
-                widget::dialog("Failed operation")
+                widget::dialog()
+                    .title("Failed operation")
                     .body(format!("{:#?}\n{}", operation, err))
                     .icon(widget::icon::from_name("dialog-error").size(64))
                     //TODO: retry action
@@ -3356,7 +3637,8 @@ impl Application for App {
                 mounter_key: _,
                 item: _,
                 error,
-            } => widget::dialog(fl!("mount-error"))
+            } => widget::dialog()
+                .title(fl!("mount-error"))
                 .body(error)
                 .icon(widget::icon::from_name("dialog-error").size(64))
                 .primary_action(
@@ -3451,7 +3733,8 @@ impl Application for App {
                 let mut parts = auth.message.splitn(2, '\n');
                 let title = parts.next().unwrap_or_default();
                 let body = parts.next().unwrap_or_default();
-                widget::dialog(title)
+                widget::dialog()
+                    .title(title)
                     .body(body)
                     .control(widget::column::with_children(controls).spacing(space_s))
                     .primary_action(
@@ -3476,7 +3759,8 @@ impl Application for App {
                 mounter_key: _,
                 uri: _,
                 error,
-            } => widget::dialog(fl!("network-drive-error"))
+            } => widget::dialog()
+                .title(fl!("network-drive-error"))
                 .body(error)
                 .icon(widget::icon::from_name("dialog-error").size(64))
                 .primary_action(
@@ -3486,7 +3770,7 @@ impl Application for App {
                     widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
                 ),
             DialogPage::NewItem { parent, name, dir } => {
-                let mut dialog = widget::dialog(if *dir {
+                let mut dialog = widget::dialog().title(if *dir {
                     fl!("create-new-folder")
                 } else {
                     fl!("create-new-file")
@@ -3572,10 +3856,13 @@ impl Application for App {
                             widget::row::with_children(vec![
                                 widget::icon(app.icon.clone()).size(32).into(),
                                 if app.is_default {
-                                    widget::text(fl!("default-app", name = app.name.as_str()))
-                                        .into()
+                                    widget::text::body(fl!(
+                                        "default-app",
+                                        name = Some(app.name.as_str())
+                                    ))
+                                    .into()
                                 } else {
-                                    widget::text(app.name.to_string()).into()
+                                    widget::text::body(app.name.to_string()).into()
                                 },
                                 widget::horizontal_space().into(),
                                 if *selected == i {
@@ -3596,7 +3883,8 @@ impl Application for App {
                     );
                 }
 
-                let mut dialog = widget::dialog(fl!("open-with-title", name = name))
+                let mut dialog = widget::dialog()
+                    .title(fl!("open-with-title", name = name))
                     .primary_action(
                         widget::button::suggested(fl!("open")).on_press(Message::DialogComplete),
                     )
@@ -3621,7 +3909,7 @@ impl Application for App {
                 dir,
             } => {
                 //TODO: combine logic with NewItem
-                let mut dialog = widget::dialog(if *dir {
+                let mut dialog = widget::dialog().title(if *dir {
                     fl!("rename-folder")
                 } else {
                     fl!("rename-file")
@@ -3696,7 +3984,8 @@ impl Application for App {
                 apply_to_all,
                 tx,
             } => {
-                let dialog = widget::dialog(fl!("replace-title", filename = to.name.as_str()))
+                let dialog = widget::dialog()
+                    .title(fl!("replace-title", filename = to.name.as_str()))
                     .body(fl!("replace-warning-operation"))
                     .control(to.replace_view(fl!("original-file"), IconSizes::default()))
                     .control(from.replace_view(fl!("replace-with"), IconSizes::default()))
@@ -3744,7 +4033,8 @@ impl Application for App {
                     Some(file_name) => file_name.to_str(),
                     None => path.as_os_str().to_str(),
                 };
-                widget::dialog(fl!("set-executable-and-launch"))
+                widget::dialog()
+                    .title(fl!("set-executable-and-launch"))
                     .primary_action(
                         widget::button::text(fl!("set-and-launch"))
                             .class(theme::Button::Suggested)
@@ -3765,6 +4055,123 @@ impl Application for App {
         Some(dialog.into())
     }
 
+    fn footer(&self) -> Option<Element<Message>> {
+        if self.progress_operations.is_empty() {
+            return None;
+        }
+
+        let cosmic_theme::Spacing {
+            space_xs, space_s, ..
+        } = theme::active().cosmic().spacing;
+
+        let mut title = String::new();
+        let mut total_progress = 0.0;
+        let mut count = 0;
+        let mut all_paused = true;
+        for (_id, (op, controller)) in self.pending_operations.iter() {
+            if !controller.is_paused() {
+                all_paused = false;
+            }
+            if op.show_progress_notification() {
+                let progress = controller.progress();
+                if title.is_empty() {
+                    title = op.pending_text(progress, controller.state());
+                }
+                total_progress += progress;
+                count += 1;
+            }
+        }
+        let running = count;
+        // Adjust the progress bar so it does not jump around when operations finish
+        for id in self.progress_operations.iter() {
+            if self.complete_operations.contains_key(&id) {
+                total_progress += 1.0;
+                count += 1;
+            }
+        }
+        let finished = count - running;
+        total_progress /= count as f32;
+        if running > 1 {
+            if finished > 0 {
+                title = fl!(
+                    "operations-running-finished",
+                    running = running,
+                    finished = finished,
+                    percent = (total_progress as i32)
+                );
+            } else {
+                title = fl!(
+                    "operations-running",
+                    running = running,
+                    percent = (total_progress as i32)
+                );
+            }
+        }
+
+        //TODO: get height from theme?
+        let progress_bar_height = Length::Fixed(4.0);
+        let progress_bar =
+            widget::progress_bar(0.0..=1.0, total_progress).height(progress_bar_height);
+
+        let container = widget::layer_container(widget::column::with_children(vec![
+            widget::row::with_children(vec![
+                progress_bar.into(),
+                if all_paused {
+                    widget::tooltip(
+                        widget::button::icon(widget::icon::from_name(
+                            "media-playback-start-symbolic",
+                        ))
+                        .on_press(Message::PendingPauseAll(false))
+                        .padding(8),
+                        widget::text::body(fl!("resume")),
+                        widget::tooltip::Position::Top,
+                    )
+                    .into()
+                } else {
+                    widget::tooltip(
+                        widget::button::icon(widget::icon::from_name(
+                            "media-playback-pause-symbolic",
+                        ))
+                        .on_press(Message::PendingPauseAll(true))
+                        .padding(8),
+                        widget::text::body(fl!("pause")),
+                        widget::tooltip::Position::Top,
+                    )
+                    .into()
+                },
+                widget::tooltip(
+                    widget::button::icon(widget::icon::from_name("window-close-symbolic"))
+                        .on_press(Message::PendingCancelAll)
+                        .padding(8),
+                    widget::text::body(fl!("cancel")),
+                    widget::tooltip::Position::Top,
+                )
+                .into(),
+            ])
+            .align_y(Alignment::Center)
+            .into(),
+            widget::text::body(title).into(),
+            widget::Space::with_height(space_s).into(),
+            widget::row::with_children(vec![
+                widget::button::link(fl!("details"))
+                    .on_press(Message::ToggleContextPage(ContextPage::EditHistory))
+                    .padding(0)
+                    .trailing_icon(true)
+                    .into(),
+                widget::horizontal_space().into(),
+                widget::button::standard(fl!("dismiss"))
+                    .on_press(Message::PendingDismiss)
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .into(),
+        ]))
+        .padding([8, space_xs])
+        .layer(cosmic_theme::Layer::Primary);
+
+        Some(container.into())
+    }
+
     fn header_start(&self) -> Vec<Element<Self::Message>> {
         vec![menu::menu_bar(
             self.tab_model.active_data::<Tab>(),
@@ -3776,14 +4183,6 @@ impl Application for App {
 
     fn header_end(&self) -> Vec<Element<Self::Message>> {
         let mut elements = Vec::with_capacity(2);
-
-        if !self.pending_operations.is_empty() {
-            elements.push(
-                widget::button::text(format!("{}", self.pending_operations.len()))
-                    .on_press(Message::ToggleContextPage(ContextPage::EditHistory))
-                    .into(),
-            );
-        }
 
         if let Some(term) = self.search_get() {
             if self.core.is_condensed() {
@@ -3905,8 +4304,26 @@ impl Application for App {
                 // The toaster is added on top of an empty element to ensure that it does not override context menus
                 tab_column =
                     tab_column.push(widget::toaster(&self.toasts, widget::horizontal_space()));
-
-                return tab_column.into();
+                return if let Some(margin) = self.margin.get(&id) {
+                    if margin.0 >= 0. || margin.2 >= 0. {
+                        tab_column = widget::column::with_children(vec![
+                            vertical_space().height(margin.0 as f32).into(),
+                            tab_column.into(),
+                            vertical_space().height(margin.2 as f32).into(),
+                        ])
+                    }
+                    if margin.1 >= 0. || margin.3 >= 0. {
+                        Element::from(widget::row::with_children(vec![
+                            horizontal_space().width(margin.1 as f32).into(),
+                            tab_column.into(),
+                            horizontal_space().width(margin.3 as f32).into(),
+                        ]))
+                    } else {
+                        tab_column.into()
+                    }
+                } else {
+                    tab_column.into()
+                };
             }
             Some(WindowKind::DesktopViewOptions) => self.desktop_view_options(),
             Some(WindowKind::Preview(entity_opt, kind)) => self.preview(entity_opt, kind, false),
@@ -3920,34 +4337,11 @@ impl Application for App {
             }
         };
 
-        //TODO: these are hacks to have a sane scroll bar
-        let cosmic_theme::Spacing { space_l, .. } = theme::active().cosmic().spacing;
-        let scrollbar_width = 8;
-        let scrollbar_margin = 8;
-        widget::container(
-            widget::scrollable(widget::row::with_children(vec![
-                content,
-                widget::Space::with_width(Length::Fixed(
-                    (scrollbar_width + scrollbar_margin).into(),
-                ))
-                .into(),
-            ]))
-            .direction(scrollable::Direction::Vertical(
-                scrollable::Scrollbar::new()
-                    .width(scrollbar_width)
-                    .scroller_width(scrollbar_width),
-            )),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding([
-            0,
-            space_l - (scrollbar_width + scrollbar_margin),
-            space_l,
-            space_l,
-        ])
-        .class(theme::Container::WindowBackground)
-        .into()
+        widget::container(widget::scrollable(content))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(theme::Container::WindowBackground)
+            .into()
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -3956,7 +4350,7 @@ impl Application for App {
         struct TrashWatcherSubscription;
 
         let mut subscriptions = vec![
-            event::listen_with(|event, status, _window_id| match event {
+            event::listen_with(|event, status, window_id| match event {
                 Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, .. }) => match status {
                     event::Status::Ignored => Some(Message::Key(modifiers, key)),
                     event::Status::Captured => None,
@@ -3965,11 +4359,19 @@ impl Application for App {
                     Some(Message::Modifiers(modifiers))
                 }
                 Event::Window(WindowEvent::CloseRequested) => Some(Message::WindowClose),
+                Event::Window(WindowEvent::Opened { position: _, size }) => {
+                    Some(Message::Size(size))
+                }
+                Event::Window(WindowEvent::Resized(s)) => Some(Message::Size(s)),
                 #[cfg(feature = "wayland")]
                 Event::PlatformSpecific(event::PlatformSpecific::Wayland(wayland_event)) => {
                     match wayland_event {
                         WaylandEvent::Output(output_event, output) => {
                             Some(Message::OutputEvent(output_event, output))
+                        }
+                        #[cfg(feature = "desktop")]
+                        WaylandEvent::OverlapNotify(event) => {
+                            Some(Message::Overlap(event, window_id))
                         }
                         _ => None,
                     }
@@ -4166,7 +4568,11 @@ impl Application for App {
         if !self.pending_operations.is_empty() {
             //TODO: inhibit suspend/shutdown?
 
-            if self.window_id_opt.is_none() {
+            if self.window_id_opt.is_some() {
+                // Refresh progress when window is open and operations are in progress
+                subscriptions.push(window::frames().map(|_| Message::None));
+            } else {
+                // Handle notification when window is closed and operations are in progress
                 #[cfg(feature = "notify")]
                 {
                     struct NotificationSubscription;
@@ -4206,17 +4612,22 @@ impl Application for App {
             }
         }
 
-        for (id, (pending_operation, _)) in self.pending_operations.iter() {
+        for (id, (pending_operation, controller)) in self.pending_operations.iter() {
             //TODO: use recipe?
             let id = *id;
             let pending_operation = pending_operation.clone();
+            let controller = controller.clone();
             subscriptions.push(Subscription::run_with_id(
                 id,
                 stream::channel(16, move |msg_tx| async move {
                     let msg_tx = Arc::new(tokio::sync::Mutex::new(msg_tx));
-                    match pending_operation.perform(id, &msg_tx).await {
-                        Ok(()) => {
-                            let _ = msg_tx.lock().await.send(Message::PendingComplete(id)).await;
+                    match pending_operation.perform(&msg_tx, controller).await {
+                        Ok(result_paths) => {
+                            let _ = msg_tx
+                                .lock()
+                                .await
+                                .send(Message::PendingComplete(id, result_paths))
+                                .await;
                         }
                         Err(err) => {
                             let _ = msg_tx
@@ -4232,10 +4643,16 @@ impl Application for App {
             ));
         }
 
+        let mut selected_preview = None;
+        if self.core.window.show_context {
+            if let ContextPage::Preview(entity_opt, PreviewKind::Selected) = self.context_page {
+                selected_preview = Some(entity_opt.unwrap_or_else(|| self.tab_model.active()));
+            }
+        }
         for entity in self.tab_model.iter() {
             if let Some(tab) = self.tab_model.data::<Tab>(entity) {
                 subscriptions.push(
-                    tab.subscription()
+                    tab.subscription(selected_preview == Some(entity))
                         .with(entity)
                         .map(|(entity, tab_msg)| Message::TabMessage(Some(entity), tab_msg)),
                 );

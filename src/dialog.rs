@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use cosmic::{
-    app::{self, cosmic::Cosmic, message, Core, Task},
+    app::{self, context_drawer, cosmic::Cosmic, message, Core, Task},
     cosmic_config, cosmic_theme, executor,
     iced::{
         event,
@@ -461,7 +461,7 @@ impl App {
 
         widget::layer_container(col)
             .layer(cosmic_theme::Layer::Primary)
-            .padding([space_xxs, space_xs])
+            .padding([8, space_xs])
             .into()
     }
 
@@ -469,13 +469,13 @@ impl App {
         let mut children = Vec::with_capacity(1);
         match kind {
             PreviewKind::Custom(PreviewItem(item)) => {
-                children.push(item.preview_view(IconSizes::default(), true));
+                children.push(item.preview_view(IconSizes::default()));
             }
             PreviewKind::Location(location) => {
                 if let Some(items) = self.tab.items_opt() {
                     for item in items.iter() {
                         if item.location_opt.as_ref() == Some(location) {
-                            children.push(item.preview_view(self.tab.config.icon_sizes, true));
+                            children.push(item.preview_view(self.tab.config.icon_sizes));
                             // Only show one property view to avoid issues like hangs when generating
                             // preview images on thousands of files
                             break;
@@ -487,7 +487,7 @@ impl App {
                 if let Some(items) = self.tab.items_opt() {
                     for item in items.iter() {
                         if item.selected {
-                            children.push(item.preview_view(self.tab.config.icon_sizes, true));
+                            children.push(item.preview_view(self.tab.config.icon_sizes));
                             // Only show one property view to avoid issues like hangs when generating
                             // preview images on thousands of files
                             break;
@@ -495,13 +495,13 @@ impl App {
                     }
                     if children.is_empty() {
                         if let Some(item) = &self.tab.parent_item_opt {
-                            children.push(item.preview_view(self.tab.config.icon_sizes, true));
+                            children.push(item.preview_view(self.tab.config.icon_sizes));
                         }
                     }
                 }
             }
         }
-        widget::settings::view_column(children).into()
+        widget::column::with_children(children).into()
     }
 
     fn rescan_tab(&self) -> Task<Message> {
@@ -794,13 +794,33 @@ impl Application for App {
         (app, commands)
     }
 
-    fn context_drawer(&self) -> Option<Element<Message>> {
+    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<Message>> {
         if !self.core.window.show_context {
             return None;
         }
 
         match &self.context_page {
-            ContextPage::Preview(_, kind) => Some(self.preview(kind).map(Message::from)),
+            ContextPage::Preview(_, kind) => {
+                let mut actions = Vec::with_capacity(3);
+                if let Some(items) = self.tab.items_opt() {
+                    for item in items.iter() {
+                        if item.selected {
+                            actions.extend(
+                                item.preview_header()
+                                    .into_iter()
+                                    .map(|element| element.map(Message::from)),
+                            )
+                        }
+                    }
+                };
+                Some(
+                    context_drawer::context_drawer(
+                        self.preview(kind).map(Message::from),
+                        Message::Preview,
+                    )
+                    .header_actions(actions),
+                )
+            }
             _ => None,
         }
     }
@@ -831,7 +851,7 @@ impl Application for App {
 
         let dialog = match dialog_page {
             DialogPage::NewFolder { parent, name } => {
-                let mut dialog = widget::dialog(fl!("create-new-folder"));
+                let mut dialog = widget::dialog().title(fl!("create-new-folder"));
 
                 let complete_maybe = if name.is_empty() {
                     None
@@ -888,17 +908,16 @@ impl Application for App {
                         .spacing(space_xxs),
                     )
             }
-            DialogPage::Replace { filename } => {
-                widget::dialog(fl!("replace-title", filename = filename.as_str()))
-                    .icon(widget::icon::from_name("dialog-question").size(64))
-                    .body(fl!("replace-warning"))
-                    .primary_action(
-                        widget::button::suggested(fl!("replace")).on_press(Message::DialogComplete),
-                    )
-                    .secondary_action(
-                        widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
-                    )
-            }
+            DialogPage::Replace { filename } => widget::dialog()
+                .title(fl!("replace-title", filename = filename.as_str()))
+                .icon(widget::icon::from_name("dialog-question").size(64))
+                .body(fl!("replace-warning"))
+                .primary_action(
+                    widget::button::suggested(fl!("replace")).on_press(Message::DialogComplete),
+                )
+                .secondary_action(
+                    widget::button::standard(fl!("cancel")).on_press(Message::DialogCancel),
+                ),
         };
 
         Some(dialog.into())
@@ -1382,7 +1401,7 @@ impl Application for App {
                         tab::Command::Action(action) => {
                             commands.push(self.update(Message::from(action.message())));
                         }
-                        tab::Command::ChangeLocation(_tab_title, _tab_path, _selection_path) => {
+                        tab::Command::ChangeLocation(_tab_title, _tab_path, _selection_paths) => {
                             commands.push(Task::batch([self.update_watcher(), self.rescan_tab()]));
                         }
                         tab::Command::Iced(iced_command) => {
@@ -1402,7 +1421,6 @@ impl Application for App {
                         tab::Command::Preview(kind) => {
                             self.context_page = ContextPage::Preview(None, kind);
                             self.set_show_context(true);
-                            self.set_context_title(self.context_page.title());
                         }
                         tab::Command::WindowDrag => {
                             commands.push(window::drag(self.flags.window_id));
@@ -1678,7 +1696,15 @@ impl Application for App {
                     std::future::pending().await
                 }),
             ),
-            self.tab.subscription().map(Message::TabMessage),
+            self.tab
+                .subscription(
+                    self.core.window.show_context
+                        && matches!(
+                            self.context_page,
+                            ContextPage::Preview(_, PreviewKind::Selected)
+                        ),
+                )
+                .map(Message::TabMessage),
         ];
 
         for (key, mounter) in MOUNTERS.iter() {

@@ -30,7 +30,7 @@ macro_rules! menu_button {
             .height(Length::Fixed(24.0))
             .align_y(Alignment::Center)
         )
-        .padding([theme::active().cosmic().spacing.space_xxxs, 16])
+        .padding([theme::active().cosmic().spacing.space_xxs, 16])
         .width(Length::Fill)
         .class(theme::Button::MenuItem)
     );
@@ -42,9 +42,9 @@ fn menu_button_optional(
     enabled: bool,
 ) -> menu::Item<Action, String> {
     if enabled {
-        menu::Item::Button(label, action)
+        menu::Item::Button(label, None, action)
     } else {
-        menu::Item::ButtonDisabled(label, action)
+        menu::Item::ButtonDisabled(label, None, action)
     }
 }
 
@@ -115,6 +115,7 @@ pub fn context_menu<'a>(
     selected_types.dedup();
     selected_trash_only = selected_trash_only && selected == 1;
     // Parse the desktop entry if it is the only selection
+    #[cfg(feature = "desktop")]
     let selected_desktop_entry = selected_desktop_entry.and_then(|path| {
         if selected == 1 {
             let lang_id = crate::localize::LANGUAGE_LOADER.current_language();
@@ -139,8 +140,11 @@ pub fn context_menu<'a>(
                 }
             } else if let Some(entry) = selected_desktop_entry {
                 children.push(menu_item(fl!("open"), Action::Open).into());
-                for (i, action) in entry.desktop_actions.into_iter().enumerate() {
-                    children.push(menu_item(action.name, Action::ExecEntryAction(i)).into())
+                #[cfg(feature = "desktop")]
+                {
+                    for (i, action) in entry.desktop_actions.into_iter().enumerate() {
+                        children.push(menu_item(action.name, Action::ExecEntryAction(i)).into())
+                    }
                 }
                 children.push(divider::horizontal::light().into());
                 children.push(menu_item(fl!("rename"), Action::Rename).into());
@@ -334,7 +338,7 @@ pub fn context_menu<'a>(
                 ..Default::default()
             }
         })
-        .width(Length::Fixed(280.0))
+        .width(Length::Fixed(360.0))
         .into()
 }
 
@@ -347,6 +351,7 @@ pub fn dialog_menu<'a>(
     let sort_item = |label, sort, dir| {
         menu::Item::CheckBox(
             label,
+            None,
             sort_name == sort && sort_direction == dir,
             Action::SetSort(sort, dir),
         )
@@ -378,11 +383,13 @@ pub fn dialog_menu<'a>(
                 vec![
                     menu::Item::CheckBox(
                         fl!("grid-view"),
+                        None,
                         matches!(tab.config.view, tab::View::Grid),
                         Action::TabViewGrid,
                     ),
                     menu::Item::CheckBox(
                         fl!("list-view"),
+                        None,
                         matches!(tab.config.view, tab::View::List),
                         Action::TabViewList,
                     ),
@@ -443,21 +450,23 @@ pub fn dialog_menu<'a>(
             menu::items(
                 key_binds,
                 vec![
-                    menu::Item::Button(fl!("zoom-in"), Action::ZoomIn),
-                    menu::Item::Button(fl!("default-size"), Action::ZoomDefault),
-                    menu::Item::Button(fl!("zoom-out"), Action::ZoomOut),
+                    menu::Item::Button(fl!("zoom-in"), None, Action::ZoomIn),
+                    menu::Item::Button(fl!("default-size"), None, Action::ZoomDefault),
+                    menu::Item::Button(fl!("zoom-out"), None, Action::ZoomOut),
                     menu::Item::Divider,
                     menu::Item::CheckBox(
                         fl!("show-hidden-files"),
+                        None,
                         tab.config.show_hidden,
                         Action::ToggleShowHidden,
                     ),
                     menu::Item::CheckBox(
                         fl!("list-directories-first"),
+                        None,
                         tab.config.folders_first,
                         Action::ToggleFoldersFirst,
                     ),
-                    menu::Item::CheckBox(fl!("show-details"), show_details, Action::Preview),
+                    menu::Item::CheckBox(fl!("show-details"), None, show_details, Action::Preview),
                     menu::Item::Divider,
                     menu_button_optional(
                         fl!("gallery-preview"),
@@ -483,6 +492,7 @@ pub fn menu_bar<'a>(
     let sort_item = |label, sort, dir| {
         menu::Item::CheckBox(
             label,
+            None,
             sort_options.map_or(false, |(sort_name, sort_direction, _)| {
                 sort_name == sort && sort_direction == dir
             }),
@@ -514,10 +524,10 @@ pub fn menu_bar<'a>(
             menu::items(
                 key_binds,
                 vec![
-                    menu::Item::Button(fl!("new-tab"), Action::TabNew),
-                    menu::Item::Button(fl!("new-window"), Action::WindowNew),
-                    menu::Item::Button(fl!("new-folder"), Action::NewFolder),
-                    menu::Item::Button(fl!("new-file"), Action::NewFile),
+                    menu::Item::Button(fl!("new-tab"), None, Action::TabNew),
+                    menu::Item::Button(fl!("new-window"), None, Action::WindowNew),
+                    menu::Item::Button(fl!("new-folder"), None, Action::NewFolder),
+                    menu::Item::Button(fl!("new-file"), None, Action::NewFile),
                     menu_button_optional(
                         fl!("open"),
                         Action::Open,
@@ -531,8 +541,8 @@ pub fn menu_bar<'a>(
                     menu::Item::Divider,
                     menu_button_optional(fl!("move-to-trash"), Action::MoveToTrash, selected > 0),
                     menu::Item::Divider,
-                    menu::Item::Button(fl!("close-tab"), Action::TabClose),
-                    menu::Item::Button(fl!("quit"), Action::WindowClose),
+                    menu::Item::Button(fl!("close-tab"), None, Action::TabClose),
+                    menu::Item::Button(fl!("quit"), None, Action::WindowClose),
                 ],
             ),
         ),
@@ -544,9 +554,9 @@ pub fn menu_bar<'a>(
                     menu_button_optional(fl!("cut"), Action::Cut, selected > 0),
                     menu_button_optional(fl!("copy"), Action::Copy, selected > 0),
                     menu_button_optional(fl!("paste"), Action::Paste, selected > 0),
-                    menu::Item::Button(fl!("select-all"), Action::SelectAll),
+                    menu::Item::Button(fl!("select-all"), None, Action::SelectAll),
                     menu::Item::Divider,
-                    menu::Item::Button(fl!("history"), Action::EditHistory),
+                    menu::Item::Button(fl!("history"), None, Action::EditHistory),
                 ],
             ),
         ),
@@ -555,32 +565,41 @@ pub fn menu_bar<'a>(
             menu::items(
                 key_binds,
                 vec![
-                    menu::Item::Button(fl!("zoom-in"), Action::ZoomIn),
-                    menu::Item::Button(fl!("default-size"), Action::ZoomDefault),
-                    menu::Item::Button(fl!("zoom-out"), Action::ZoomOut),
+                    menu::Item::Button(fl!("zoom-in"), None, Action::ZoomIn),
+                    menu::Item::Button(fl!("default-size"), None, Action::ZoomDefault),
+                    menu::Item::Button(fl!("zoom-out"), None, Action::ZoomOut),
                     menu::Item::Divider,
                     menu::Item::CheckBox(
                         fl!("grid-view"),
+                        None,
                         tab_opt.map_or(false, |tab| matches!(tab.config.view, tab::View::Grid)),
                         Action::TabViewGrid,
                     ),
                     menu::Item::CheckBox(
                         fl!("list-view"),
+                        None,
                         tab_opt.map_or(false, |tab| matches!(tab.config.view, tab::View::List)),
                         Action::TabViewList,
                     ),
                     menu::Item::Divider,
                     menu::Item::CheckBox(
                         fl!("show-hidden-files"),
+                        None,
                         tab_opt.map_or(false, |tab| tab.config.show_hidden),
                         Action::ToggleShowHidden,
                     ),
                     menu::Item::CheckBox(
                         fl!("list-directories-first"),
+                        None,
                         tab_opt.map_or(false, |tab| tab.config.folders_first),
                         Action::ToggleFoldersFirst,
                     ),
-                    menu::Item::CheckBox(fl!("show-details"), config.show_details, Action::Preview),
+                    menu::Item::CheckBox(
+                        fl!("show-details"),
+                        None,
+                        config.show_details,
+                        Action::Preview,
+                    ),
                     menu::Item::Divider,
                     menu_button_optional(
                         fl!("gallery-preview"),
@@ -588,9 +607,9 @@ pub fn menu_bar<'a>(
                         selected_gallery > 0,
                     ),
                     menu::Item::Divider,
-                    menu::Item::Button(fl!("menu-settings"), Action::Settings),
+                    menu::Item::Button(fl!("menu-settings"), None, Action::Settings),
                     menu::Item::Divider,
-                    menu::Item::Button(fl!("menu-about"), Action::About),
+                    menu::Item::Button(fl!("menu-about"), None, Action::About),
                 ],
             ),
         ),
@@ -635,7 +654,7 @@ pub fn menu_bar<'a>(
         ),
     ])
     .item_height(ItemHeight::Dynamic(40))
-    .item_width(ItemWidth::Uniform(240))
+    .item_width(ItemWidth::Uniform(360))
     .spacing(theme::active().cosmic().spacing.space_xxxs.into())
     .into()
 }
@@ -684,6 +703,6 @@ pub fn location_context_menu<'a>(ancestor_index: usize) -> Element<'a, tab::Mess
                 ..Default::default()
             }
         })
-        .width(Length::Fixed(240.0))
+        .width(Length::Fixed(360.0))
         .into()
 }

@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use walkdir::WalkDir;
 
 use crate::{
@@ -18,8 +18,17 @@ use crate::{
     tab,
 };
 
+pub use self::controller::{Controller, ControllerState};
+pub mod controller;
+
+use self::reader::OpReader;
+pub mod reader;
+
+use self::recursive::Context;
+pub mod recursive;
+
 fn handle_replace(
-    msg_tx: &Arc<Mutex<Sender<Message>>>,
+    msg_tx: &Arc<TokioMutex<Sender<Message>>>,
     file_from: PathBuf,
     file_to: PathBuf,
     multiple: bool,
@@ -57,38 +66,6 @@ fn handle_replace(
     })
 }
 
-fn handle_progress_state(
-    msg_tx: &Arc<Mutex<Sender<Message>>>,
-    progress: &fs_extra::TransitProcess,
-) -> fs_extra::dir::TransitProcessResult {
-    log::warn!("{:?}", progress);
-    match progress.state {
-        fs_extra::dir::TransitState::Normal => fs_extra::dir::TransitProcessResult::ContinueOrAbort,
-        fs_extra::dir::TransitState::Exists => {
-            let Some(file_from) = progress.file_from.clone() else {
-                log::warn!("missing file_from in progress");
-                return fs_extra::dir::TransitProcessResult::Abort;
-            };
-
-            let Some(file_to) = progress.file_to.clone() else {
-                log::warn!("missing file_to in progress");
-                return fs_extra::dir::TransitProcessResult::Abort;
-            };
-
-            if file_from == file_to {
-                log::warn!("trying to copy {:?} to itself", file_from);
-                return fs_extra::dir::TransitProcessResult::Abort;
-            }
-
-            handle_replace(msg_tx, file_from, file_to, true).into()
-        }
-        fs_extra::dir::TransitState::NoAccess => {
-            //TODO: permission error dialog
-            fs_extra::dir::TransitProcessResult::ContinueOrAbort
-        }
-    }
-}
-
 fn get_directory_name(file_name: &str) -> &str {
     const SUPPORTED_EXTENSIONS: [&str; 4] = [".tar.gz", ".tgz", ".tar", ".zip"];
 
@@ -100,6 +77,142 @@ fn get_directory_name(file_name: &str) -> &str {
     file_name
 }
 
+// From https://docs.rs/zip/latest/zip/read/struct.ZipArchive.html#method.extract, with cancellation and progress added
+fn zip_extract<R: io::Read + io::Seek, P: AsRef<Path>>(
+    archive: &mut zip::ZipArchive<R>,
+    directory: P,
+    controller: Controller,
+) -> zip::result::ZipResult<()> {
+    use std::{ffi::OsString, fs};
+    use zip::result::ZipError;
+
+    fn make_writable_dir_all<T: AsRef<Path>>(outpath: T) -> Result<(), ZipError> {
+        fs::create_dir_all(outpath.as_ref())?;
+        #[cfg(unix)]
+        {
+            // Dirs must be writable until all normal files are extracted
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                outpath.as_ref(),
+                std::fs::Permissions::from_mode(
+                    0o700 | std::fs::metadata(outpath.as_ref())?.permissions().mode(),
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    let mut files_by_unix_mode = Vec::new();
+    let mut buffer = vec![0; 4 * 1024 * 1024];
+    let total_files = archive.len();
+    for i in 0..total_files {
+        controller
+            .check()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+        controller.set_progress((i as f32) / total_files as f32);
+
+        let mut file = archive.by_index(i)?;
+        let filepath = file
+            .enclosed_name()
+            .ok_or(ZipError::InvalidArchive("Invalid file path"))?;
+
+        let outpath = directory.as_ref().join(filepath);
+
+        if file.is_dir() {
+            make_writable_dir_all(&outpath)?;
+            continue;
+        }
+        let symlink_target = if file.is_symlink() && (cfg!(unix) || cfg!(windows)) {
+            let mut target = Vec::with_capacity(file.size() as usize);
+            file.read_to_end(&mut target)?;
+            Some(target)
+        } else {
+            None
+        };
+        drop(file);
+        if let Some(p) = outpath.parent() {
+            make_writable_dir_all(p)?;
+        }
+        if let Some(target) = symlink_target {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                let target = OsString::from_vec(target);
+                std::os::unix::fs::symlink(&target, outpath.as_path())?;
+            }
+            #[cfg(windows)]
+            {
+                let Ok(target) = String::from_utf8(target) else {
+                    return Err(ZipError::InvalidArchive("Invalid UTF-8 as symlink target"));
+                };
+                let target = target.into_boxed_str();
+                let target_is_dir_from_archive =
+                    archive.shared.files.contains_key(&target) && is_dir(&target);
+                let target_path = directory.as_ref().join(OsString::from(target.to_string()));
+                let target_is_dir = if target_is_dir_from_archive {
+                    true
+                } else if let Ok(meta) = std::fs::metadata(&target_path) {
+                    meta.is_dir()
+                } else {
+                    false
+                };
+                if target_is_dir {
+                    std::os::windows::fs::symlink_dir(target_path, outpath.as_path())?;
+                } else {
+                    std::os::windows::fs::symlink_file(target_path, outpath.as_path())?;
+                }
+            }
+            continue;
+        }
+        let mut file = archive.by_index(i)?;
+        let total = file.size();
+        let mut outfile = fs::File::create(&outpath)?;
+        let mut current = 0;
+        loop {
+            controller
+                .check()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            outfile.write_all(&buffer[..count])?;
+            current += count as u64;
+
+            if current < total {
+                let file_progress = current as f32 / total as f32;
+                let total_progress = (i as f32 + file_progress) / total_files as f32;
+                controller.set_progress(total_progress);
+            }
+        }
+        outfile.sync_all()?;
+        #[cfg(unix)]
+        {
+            // Check for real permissions, which we'll set in a second pass
+            if let Some(mode) = file.unix_mode() {
+                files_by_unix_mode.push((outpath.clone(), mode));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::cmp::Reverse;
+        use std::os::unix::fs::PermissionsExt;
+
+        if files_by_unix_mode.len() > 1 {
+            // Ensure we update children's permissions before making a parent unwritable
+            files_by_unix_mode.sort_by_key(|(path, _)| Reverse(path.clone()));
+        }
+        for (path, mode) in files_by_unix_mode.into_iter() {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ReplaceResult {
     Replace(bool),
@@ -108,223 +221,72 @@ pub enum ReplaceResult {
     Cancel,
 }
 
-impl From<ReplaceResult> for fs_extra::dir::TransitProcessResult {
-    fn from(f: ReplaceResult) -> fs_extra::dir::TransitProcessResult {
-        match f {
-            ReplaceResult::Replace(apply_to_all) => {
-                if apply_to_all {
-                    fs_extra::dir::TransitProcessResult::OverwriteAll
-                } else {
-                    fs_extra::dir::TransitProcessResult::Overwrite
-                }
-            }
-            ReplaceResult::KeepBoth => {
-                log::warn!("tried to keep both when replacing multiple files");
-                fs_extra::dir::TransitProcessResult::Abort
-            }
-            ReplaceResult::Skip(apply_to_all) => {
-                if apply_to_all {
-                    fs_extra::dir::TransitProcessResult::SkipAll
-                } else {
-                    fs_extra::dir::TransitProcessResult::Skip
-                }
-            }
-            ReplaceResult::Cancel => fs_extra::dir::TransitProcessResult::Abort,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum Operation {
-    /// Compress files
-    Compress {
-        paths: Vec<PathBuf>,
-        to: PathBuf,
-        archive_type: ArchiveType,
-    },
-    /// Copy items
-    Copy {
-        paths: Vec<PathBuf>,
-        to: PathBuf,
-    },
-    /// Move items to the trash
-    Delete {
-        paths: Vec<PathBuf>,
-    },
-    /// Empty the trash
-    EmptyTrash,
-    /// Uncompress files
-    Extract {
-        paths: Vec<PathBuf>,
-        to: PathBuf,
-    },
-    /// Move items
-    Move {
-        paths: Vec<PathBuf>,
-        to: PathBuf,
-    },
-    NewFile {
-        path: PathBuf,
-    },
-    NewFolder {
-        path: PathBuf,
-    },
-    Rename {
-        from: PathBuf,
-        to: PathBuf,
-    },
-    /// Restore a path from the trash
-    Restore {
-        paths: Vec<trash::TrashItem>,
-    },
-    /// Set executable and launch
-    SetExecutableAndLaunch {
-        path: PathBuf,
-    },
-}
-
 async fn copy_or_move(
     paths: Vec<PathBuf>,
     to: PathBuf,
     moving: bool,
-    id: u64,
-    msg_tx: &Arc<Mutex<Sender<Message>>>,
-) -> Result<(), String> {
-    // Handle duplicate file names by renaming paths
-    let (paths, to): (Vec<_>, Vec<_>) = tokio::task::spawn_blocking(move || {
-        paths
-            .into_iter()
-            .zip(std::iter::repeat(to.as_path()))
-            .map(|(from, to)| {
-                if matches!(from.parent(), Some(parent) if parent == to) && !moving {
-                    // `from`'s parent is equal to `to` which means we're copying to the same
-                    // directory (duplicating files)
-                    let to = copy_unique_path(&from, &to);
-                    (from, to)
-                } else if let Some(name) = (from.is_file() || moving)
-                    .then(|| from.file_name())
-                    .flatten()
-                {
-                    let to = to.join(name);
-                    (from, to)
-                } else {
-                    (from, to.to_owned())
-                }
-            })
-            .unzip()
-    })
-    .await
-    .unwrap();
-
+    msg_tx: &Arc<TokioMutex<Sender<Message>>>,
+    controller: Controller,
+) -> Result<OperationSelection, String> {
     let msg_tx = msg_tx.clone();
-    tokio::task::spawn_blocking(move || -> fs_extra::error::Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<OperationSelection, String> {
         log::info!(
             "{} {:?} to {:?}",
             if moving { "Move" } else { "Copy" },
             paths,
             to
         );
-        let total_paths = paths.len();
-        for (path_i, (from, mut to)) in paths.into_iter().zip(to.into_iter()).enumerate() {
-            let handler = |copied_bytes, total_bytes| {
-                let item_progress = if total_bytes == 0 {
-                    1.0
-                } else {
-                    copied_bytes as f32 / total_bytes as f32
-                };
-                let total_progress = (item_progress + path_i as f32) / total_paths as f32;
-                executor::block_on(async {
-                    let _ = msg_tx
-                        .lock()
-                        .await
-                        .send(Message::PendingProgress(id, 100.0 * total_progress))
-                        .await;
-                })
-            };
 
-            if from == to {
-                log::info!(
-                    "Skipping {} of {:?} to itself",
-                    if moving { "move" } else { "copy" },
-                    from
-                );
-                handler(0, 0);
-                continue;
-            }
-
-            if from.is_dir() {
-                let options = fs_extra::dir::CopyOptions::default().copy_inside(true);
-                if moving {
-                    fs_extra::move_items_with_progress(
-                        &[from],
-                        to,
-                        &options,
-                        |progress: fs_extra::TransitProcess| {
-                            handler(progress.copied_bytes, progress.total_bytes);
-                            handle_progress_state(&msg_tx, &progress)
-                        },
-                    )?;
+        // Handle duplicate file names by renaming paths
+        let from_to_pairs: Vec<(PathBuf, PathBuf)> = paths
+            .into_iter()
+            .zip(std::iter::repeat(to.as_path()))
+            .filter_map(|(from, to)| {
+                if matches!(from.parent(), Some(parent) if parent == to) && !moving {
+                    // `from`'s parent is equal to `to` which means we're copying to the same
+                    // directory (duplicating files)
+                    let to = copy_unique_path(&from, &to);
+                    Some((from, to))
+                } else if let Some(name) = from.file_name() {
+                    let to = to.join(name);
+                    Some((from, to))
                 } else {
-                    fs_extra::copy_items_with_progress(
-                        &[from],
-                        to,
-                        &options,
-                        |progress: fs_extra::TransitProcess| {
-                            handler(progress.copied_bytes, progress.total_bytes);
-                            handle_progress_state(&msg_tx, &progress)
-                        },
-                    )?;
+                    //TODO: how to handle from missing file name?
+                    None
                 }
-            } else {
-                let mut options = fs_extra::file::CopyOptions::default();
-                if to.exists() {
-                    match handle_replace(&msg_tx, from.clone(), to.clone(), false) {
-                        ReplaceResult::Replace(_) => {
-                            options.overwrite = true;
-                        }
-                        ReplaceResult::KeepBoth => {
-                            match to.parent() {
-                                Some(to_parent) => {
-                                    to = copy_unique_path(&from, &to_parent);
-                                }
-                                None => {
-                                    log::warn!("failed to get parent of {:?}", to);
-                                    //TODO: error?
-                                }
-                            }
-                        }
-                        ReplaceResult::Skip(_) => {
-                            options.skip_exist = true;
-                        }
-                        ReplaceResult::Cancel => {
-                            //TODO: be silent, but collect actual changes made for undo
-                            continue;
+            })
+            .collect();
+
+        let mut context = Context::new(controller.clone());
+
+        {
+            context = context.on_progress(move |_op, progress| {
+                let item_progress = match progress.total_bytes {
+                    Some(total_bytes) => {
+                        if total_bytes == 0 {
+                            1.0
+                        } else {
+                            progress.current_bytes as f32 / total_bytes as f32
                         }
                     }
-                }
-                if moving {
-                    //TODO: optimize to fs::rename when possible
-                    fs_extra::file::move_file_with_progress(
-                        from,
-                        to,
-                        &options,
-                        |progress: fs_extra::file::TransitProcess| {
-                            handler(progress.copied_bytes, progress.total_bytes);
-                        },
-                    )?;
-                } else {
-                    fs_extra::file::copy_with_progress(
-                        from,
-                        to,
-                        &options,
-                        |progress: fs_extra::file::TransitProcess| {
-                            handler(progress.copied_bytes, progress.total_bytes);
-                        },
-                    )?;
-                }
-            }
+                    None => 0.0,
+                };
+                let total_progress =
+                    (item_progress + progress.current_ops as f32) / progress.total_ops as f32;
+                controller.set_progress(total_progress);
+            });
         }
-        Ok(())
+
+        {
+            let msg_tx = msg_tx.clone();
+            context = context.on_replace(move |op| {
+                handle_replace(&msg_tx, op.from.clone(), op.to.clone(), true)
+            });
+        }
+
+        context.recursive_copy_or_move(from_to_pairs, moving)?;
+
+        Ok(context.op_sel)
     })
     .await
     .map_err(err_str)?
@@ -431,39 +393,107 @@ fn paths_parent_name<'a>(paths: &'a Vec<PathBuf>) -> Cow<'a, str> {
     file_name(parent)
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct OperationSelection {
+    // Paths to ignore if they are already selected
+    pub ignored: Vec<PathBuf>,
+    // Paths to select
+    pub selected: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum Operation {
+    /// Compress files
+    Compress {
+        paths: Vec<PathBuf>,
+        to: PathBuf,
+        archive_type: ArchiveType,
+    },
+    /// Copy items
+    Copy {
+        paths: Vec<PathBuf>,
+        to: PathBuf,
+    },
+    /// Move items to the trash
+    Delete {
+        paths: Vec<PathBuf>,
+    },
+    /// Empty the trash
+    EmptyTrash,
+    /// Uncompress files
+    Extract {
+        paths: Vec<PathBuf>,
+        to: PathBuf,
+    },
+    /// Move items
+    Move {
+        paths: Vec<PathBuf>,
+        to: PathBuf,
+    },
+    NewFile {
+        path: PathBuf,
+    },
+    NewFolder {
+        path: PathBuf,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// Restore a path from the trash
+    Restore {
+        items: Vec<trash::TrashItem>,
+    },
+    /// Set executable and launch
+    SetExecutableAndLaunch {
+        path: PathBuf,
+    },
+}
+
 impl Operation {
-    pub fn pending_text(&self) -> String {
+    pub fn pending_text(&self, ratio: f32, state: ControllerState) -> String {
+        let percent = (ratio * 100.0) as i32;
+        let progress = || match state {
+            ControllerState::Running => fl!("progress", percent = percent),
+            ControllerState::Paused => fl!("progress-paused", percent = percent),
+            ControllerState::Cancelled => fl!("progress-cancelled", percent = percent),
+        };
         match self {
             Self::Compress { paths, to, .. } => fl!(
                 "compressing",
                 items = paths.len(),
                 from = paths_parent_name(paths),
-                to = file_name(to)
+                to = file_name(to),
+                progress = progress()
             ),
             Self::Copy { paths, to } => fl!(
                 "copying",
                 items = paths.len(),
                 from = paths_parent_name(paths),
-                to = file_name(to)
+                to = file_name(to),
+                progress = progress()
             ),
             Self::Delete { paths } => fl!(
                 "moving",
                 items = paths.len(),
                 from = paths_parent_name(paths),
-                to = fl!("trash")
+                to = fl!("trash"),
+                progress = progress()
             ),
-            Self::EmptyTrash => fl!("emptying-trash"),
+            Self::EmptyTrash => fl!("emptying-trash", progress = progress()),
             Self::Extract { paths, to } => fl!(
                 "extracting",
                 items = paths.len(),
                 from = paths_parent_name(paths),
-                to = file_name(to)
+                to = file_name(to),
+                progress = progress()
             ),
             Self::Move { paths, to } => fl!(
                 "moving",
                 items = paths.len(),
                 from = paths_parent_name(paths),
-                to = file_name(to)
+                to = file_name(to),
+                progress = progress()
             ),
             Self::NewFile { path } => fl!(
                 "creating",
@@ -478,7 +508,7 @@ impl Operation {
             Self::Rename { from, to } => {
                 fl!("renaming", from = file_name(from), to = file_name(to))
             }
-            Self::Restore { paths } => fl!("restoring", items = paths.len()),
+            Self::Restore { items } => fl!("restoring", items = items.len(), progress = progress()),
             Self::SetExecutableAndLaunch { path } => {
                 fl!("setting-executable-and-launching", name = file_name(path))
             }
@@ -529,10 +559,27 @@ impl Operation {
                 parent = parent_name(path)
             ),
             Self::Rename { from, to } => fl!("renamed", from = file_name(from), to = file_name(to)),
-            Self::Restore { paths } => fl!("restored", items = paths.len()),
+            Self::Restore { items } => fl!("restored", items = items.len()),
             Self::SetExecutableAndLaunch { path } => {
                 fl!("set-executable-and-launched", name = file_name(path))
             }
+        }
+    }
+
+    pub fn show_progress_notification(&self) -> bool {
+        // Long running operations show a progress notification
+        match self {
+            Self::Compress { .. }
+            | Self::Copy { .. }
+            | Self::Delete { .. }
+            | Self::EmptyTrash
+            | Self::Extract { .. }
+            | Self::Move { .. }
+            | Self::Restore { .. } => true,
+            Self::NewFile { .. }
+            | Self::NewFolder { .. }
+            | Self::Rename { .. }
+            | Self::SetExecutableAndLaunch { .. } => false,
         }
     }
 
@@ -549,27 +596,26 @@ impl Operation {
     /// Perform the operation
     pub async fn perform(
         self,
-        id: u64,
-        msg_tx: &Arc<Mutex<Sender<Message>>>,
-    ) -> Result<(), String> {
-        let _ = msg_tx
-            .lock()
-            .await
-            .send(Message::PendingProgress(id, 0.0))
-            .await;
+        msg_tx: &Arc<TokioMutex<Sender<Message>>>,
+        controller: Controller,
+    ) -> Result<OperationSelection, String> {
+        let controller_clone = controller.clone();
 
         //TODO: IF ERROR, RETURN AN Operation THAT CAN UNDO THE CURRENT STATE
-        //TODO: SAFELY HANDLE CANCEL
-        match self {
+        let paths = match self {
             Self::Compress {
                 paths,
                 to,
                 archive_type,
             } => {
-                let msg_tx = msg_tx.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                tokio::task::spawn_blocking(move || -> Result<OperationSelection, String> {
                     let Some(relative_root) = to.parent() else {
                         return Err(format!("path {:?} has no parent directory", to));
+                    };
+
+                    let op_sel = OperationSelection {
+                        ignored: paths.clone(),
+                        selected: vec![to.clone()],
                     };
 
                     let mut paths = paths;
@@ -578,7 +624,7 @@ impl Operation {
                             let new_paths_it = WalkDir::new(path).into_iter();
                             for entry in new_paths_it.skip(1) {
                                 let entry = entry.map_err(err_str)?;
-                                paths.push(entry.path().to_path_buf());
+                                paths.push(entry.into_path());
                             }
                         }
                     }
@@ -595,14 +641,9 @@ impl Operation {
 
                             let total_paths = paths.len();
                             for (i, path) in paths.iter().enumerate() {
-                                executor::block_on(async {
-                                    let total_progress = (i as f32) / total_paths as f32;
-                                    let _ = msg_tx
-                                        .lock()
-                                        .await
-                                        .send(Message::PendingProgress(id, 100.0 * total_progress))
-                                        .await;
-                                });
+                                controller.check()?;
+
+                                controller.set_progress((i as f32) / total_paths as f32);
 
                                 if let Some(relative_path) =
                                     path.strip_prefix(relative_root).map_err(err_str)?.to_str()
@@ -621,35 +662,50 @@ impl Operation {
                                 .map(zip::ZipWriter::new)
                                 .map_err(err_str)?;
 
-                            //TODO: set unix_permissions per file?
-                            let zip_options = zip::write::SimpleFileOptions::default();
-
                             let total_paths = paths.len();
+                            let mut buffer = vec![0; 4 * 1024 * 1024];
                             for (i, path) in paths.iter().enumerate() {
-                                executor::block_on(async {
-                                    let total_progress = (i as f32) / total_paths as f32;
-                                    let _ = msg_tx
-                                        .lock()
-                                        .await
-                                        .send(Message::PendingProgress(id, 100.0 * total_progress))
-                                        .await;
-                                });
+                                controller.check()?;
 
+                                controller.set_progress((i as f32) / total_paths as f32);
+
+                                let mut zip_options = zip::write::SimpleFileOptions::default();
                                 if let Some(relative_path) =
                                     path.strip_prefix(relative_root).map_err(err_str)?.to_str()
                                 {
                                     if path.is_file() {
+                                        let mut file = fs::File::open(&path).map_err(err_str)?;
+                                        let metadata = file.metadata().map_err(err_str)?;
+                                        let total = metadata.len();
+                                        if total >= 4 * 1024 * 1024 * 1024 {
+                                            // The large file option must be enabled for files above 4 GiB
+                                            zip_options = zip_options.large_file(true);
+                                        }
+                                        #[cfg(unix)]
+                                        {
+                                            use std::os::unix::fs::MetadataExt;
+                                            let mode = metadata.mode();
+                                            zip_options = zip_options.unix_permissions(mode);
+                                        }
                                         archive
                                             .start_file(relative_path, zip_options)
                                             .map_err(err_str)?;
+                                        let mut current = 0;
+                                        loop {
+                                            controller.check()?;
 
-                                        let mut buffer = Vec::new();
-                                        let mut file = fs::File::open(&path)
-                                            .map(io::BufReader::new)
-                                            .map_err(err_str)?;
+                                            let count = file.read(&mut buffer).map_err(err_str)?;
+                                            if count == 0 {
+                                                break;
+                                            }
+                                            archive.write_all(&buffer[..count]).map_err(err_str)?;
+                                            current += count;
 
-                                        file.read_to_end(&mut buffer).map_err(err_str)?;
-                                        archive.write_all(&buffer).map_err(err_str)?;
+                                            let file_progress = current as f32 / total as f32;
+                                            let total_progress =
+                                                (i as f32 + file_progress) / total_paths as f32;
+                                            controller.set_progress(total_progress);
+                                        }
                                     } else {
                                         archive
                                             .add_directory(relative_path, zip_options)
@@ -662,34 +718,27 @@ impl Operation {
                         }
                     }
 
-                    Ok(())
+                    Ok(op_sel)
                 })
                 .await
                 .map_err(err_str)?
-                .map_err(err_str)?;
+                .map_err(err_str)?
             }
-            Self::Copy { paths, to } => {
-                copy_or_move(paths, to, false, id, msg_tx).await?;
-            }
+            Self::Copy { paths, to } => copy_or_move(paths, to, false, msg_tx, controller).await?,
             Self::Delete { paths } => {
                 let total = paths.len();
-                let mut count = 0;
-                for path in paths {
-                    let items_opt = tokio::task::spawn_blocking(|| trash::delete(path))
+                for (i, path) in paths.into_iter().enumerate() {
+                    controller.check()?;
+
+                    controller.set_progress((i as f32) / (total as f32));
+
+                    let _items_opt = tokio::task::spawn_blocking(|| trash::delete(path))
                         .await
                         .map_err(err_str)?
                         .map_err(err_str)?;
                     //TODO: items_opt allows for easy restore
-                    count += 1;
-                    let _ = msg_tx
-                        .lock()
-                        .await
-                        .send(Message::PendingProgress(
-                            id,
-                            100.0 * (count as f32) / (total as f32),
-                        ))
-                        .await;
                 }
+                OperationSelection::default()
             }
             Self::EmptyTrash => {
                 #[cfg(any(
@@ -702,33 +751,31 @@ impl Operation {
                     )
                 ))]
                 {
-                    tokio::task::spawn_blocking(|| {
-                        let items = trash::os_limited::list()?;
-                        trash::os_limited::purge_all(items)
+                    tokio::task::spawn_blocking(move || -> Result<(), String> {
+                        let items = trash::os_limited::list().map_err(err_str)?;
+                        let count = items.len();
+                        for (i, item) in items.into_iter().enumerate() {
+                            controller.check()?;
+
+                            controller.set_progress(i as f32 / count as f32);
+
+                            trash::os_limited::purge_all([item]).map_err(err_str)?;
+                        }
+                        Ok(())
                     })
                     .await
-                    .map_err(err_str)?
-                    .map_err(err_str)?;
+                    .map_err(err_str)??;
                 }
-                let _ = msg_tx
-                    .lock()
-                    .await
-                    .send(Message::PendingProgress(id, 100.0))
-                    .await;
+                OperationSelection::default()
             }
             Self::Extract { paths, to } => {
-                let msg_tx = msg_tx.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                tokio::task::spawn_blocking(move || -> Result<OperationSelection, String> {
                     let total_paths = paths.len();
+                    let mut op_sel = OperationSelection::default();
                     for (i, path) in paths.iter().enumerate() {
-                        executor::block_on(async {
-                            let total_progress = (i as f32) / total_paths as f32;
-                            let _ = msg_tx
-                                .lock()
-                                .await
-                                .send(Message::PendingProgress(id, 100.0 * total_progress))
-                                .await;
-                        });
+                        controller.check()?;
+
+                        controller.set_progress((i as f32) / total_paths as f32);
 
                         let to = to.to_owned();
 
@@ -742,17 +789,21 @@ impl Operation {
                                 }
                             }
 
+                            op_sel.ignored.push(path.clone());
+                            op_sel.selected.push(new_dir.clone());
+
+                            let controller = controller.clone();
                             let mime = mime_for_path(&path);
                             match mime.essence_str() {
                                 "application/gzip" | "application/x-compressed-tar" => {
-                                    fs::File::open(path)
+                                    OpReader::new(path, controller)
                                         .map(io::BufReader::new)
                                         .map(flate2::read::GzDecoder::new)
                                         .map(tar::Archive::new)
                                         .and_then(|mut archive| archive.unpack(&new_dir))
                                         .map_err(err_str)?
                                 }
-                                "application/x-tar" => fs::File::open(path)
+                                "application/x-tar" => OpReader::new(path, controller)
                                     .map(io::BufReader::new)
                                     .map(tar::Archive::new)
                                     .and_then(|mut archive| archive.unpack(&new_dir))
@@ -761,24 +812,26 @@ impl Operation {
                                     .map(io::BufReader::new)
                                     .map(zip::ZipArchive::new)
                                     .map_err(err_str)?
-                                    .and_then(|mut archive| archive.extract(&new_dir))
+                                    .and_then(move |mut archive| {
+                                        zip_extract(&mut archive, &new_dir, controller)
+                                    })
                                     .map_err(err_str)?,
                                 #[cfg(feature = "bzip2")]
                                 "application/x-bzip" | "application/x-bzip-compressed-tar" => {
-                                    fs::File::open(path)
+                                    OpReader::new(path, controller)
                                         .map(io::BufReader::new)
                                         .map(bzip2::read::BzDecoder::new)
                                         .map(tar::Archive::new)
-                                        .and_then(|mut archive| archive.unpack(new_dir))
+                                        .and_then(|mut archive| archive.unpack(&new_dir))
                                         .map_err(err_str)?
                                 }
                                 #[cfg(feature = "liblzma")]
                                 "application/x-xz" | "application/x-xz-compressed-tar" => {
-                                    fs::File::open(path)
+                                    OpReader::new(path, controller)
                                         .map(io::BufReader::new)
                                         .map(liblzma::read::XzDecoder::new)
                                         .map(tar::Archive::new)
-                                        .and_then(|mut archive| archive.unpack(new_dir))
+                                        .and_then(|mut archive| archive.unpack(&new_dir))
                                         .map_err(err_str)?
                                 }
                                 _ => Err(format!("unsupported mime type {:?}", mime))?,
@@ -786,47 +839,48 @@ impl Operation {
                         }
                     }
 
-                    Ok(())
+                    Ok(op_sel)
                 })
                 .await
                 .map_err(err_str)?
-                .map_err(err_str)?;
+                .map_err(err_str)?
             }
-            Self::Move { paths, to } => {
-                copy_or_move(paths, to, true, id, msg_tx).await?;
-            }
+            Self::Move { paths, to } => copy_or_move(paths, to, true, msg_tx, controller).await?,
             Self::NewFolder { path } => {
-                tokio::task::spawn_blocking(|| fs::create_dir(path))
-                    .await
-                    .map_err(err_str)?
-                    .map_err(err_str)?;
-                let _ = msg_tx
-                    .lock()
-                    .await
-                    .send(Message::PendingProgress(id, 100.0))
-                    .await;
+                tokio::task::spawn_blocking(move || -> Result<OperationSelection, String> {
+                    controller.check()?;
+                    fs::create_dir(&path).map_err(err_str)?;
+                    Ok(OperationSelection {
+                        ignored: Vec::new(),
+                        selected: vec![path],
+                    })
+                })
+                .await
+                .map_err(err_str)??
             }
             Self::NewFile { path } => {
-                tokio::task::spawn_blocking(|| fs::File::create(path))
-                    .await
-                    .map_err(err_str)?
-                    .map_err(err_str)?;
-                let _ = msg_tx
-                    .lock()
-                    .await
-                    .send(Message::PendingProgress(id, 100.0))
-                    .await;
+                tokio::task::spawn_blocking(move || -> Result<OperationSelection, String> {
+                    controller.check()?;
+                    fs::File::create(&path).map_err(err_str)?;
+                    Ok(OperationSelection {
+                        ignored: Vec::new(),
+                        selected: vec![path],
+                    })
+                })
+                .await
+                .map_err(err_str)??
             }
             Self::Rename { from, to } => {
-                tokio::task::spawn_blocking(|| fs::rename(from, to))
-                    .await
-                    .map_err(err_str)?
-                    .map_err(err_str)?;
-                let _ = msg_tx
-                    .lock()
-                    .await
-                    .send(Message::PendingProgress(id, 100.0))
-                    .await;
+                tokio::task::spawn_blocking(move || -> Result<OperationSelection, String> {
+                    controller.check()?;
+                    fs::rename(&from, &to).map_err(err_str)?;
+                    Ok(OperationSelection {
+                        ignored: vec![from],
+                        selected: vec![to],
+                    })
+                })
+                .await
+                .map_err(err_str)??
             }
             #[cfg(target_os = "macos")]
             Self::Restore { .. } => {
@@ -834,61 +888,59 @@ impl Operation {
                 return Err("Restoring from trash is not supported on macos".to_string());
             }
             #[cfg(not(target_os = "macos"))]
-            Self::Restore { paths } => {
-                let total = paths.len();
-                let mut count = 0;
-                for path in paths {
-                    tokio::task::spawn_blocking(|| trash::os_limited::restore_all([path]))
+            Self::Restore { items } => {
+                let total = items.len();
+                let mut paths = Vec::with_capacity(total);
+                for (i, item) in items.into_iter().enumerate() {
+                    controller.check()?;
+
+                    controller.set_progress((i as f32) / (total as f32));
+
+                    paths.push(item.original_path());
+
+                    tokio::task::spawn_blocking(|| trash::os_limited::restore_all([item]))
                         .await
                         .map_err(err_str)?
                         .map_err(err_str)?;
-                    count += 1;
-                    let _ = msg_tx
-                        .lock()
-                        .await
-                        .send(Message::PendingProgress(
-                            id,
-                            100.0 * (count as f32) / (total as f32),
-                        ))
-                        .await;
+                }
+                OperationSelection {
+                    ignored: Vec::new(),
+                    selected: paths,
                 }
             }
             Self::SetExecutableAndLaunch { path } => {
-                tokio::task::spawn_blocking(move || -> io::Result<()> {
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
                     //TODO: what to do on non-Unix systems?
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        let mut perms = fs::metadata(&path)?.permissions();
+
+                        controller.check()?;
+
+                        let mut perms = fs::metadata(&path).map_err(err_str)?.permissions();
                         let current_mode = perms.mode();
                         let new_mode = current_mode | 0o111;
                         perms.set_mode(new_mode);
-                        fs::set_permissions(&path, perms)?;
+                        fs::set_permissions(&path, perms).map_err(err_str)?;
                     }
 
+                    controller.check()?;
+
                     let mut command = std::process::Command::new(path);
-                    spawn_detached(&mut command)?;
+                    spawn_detached(&mut command).map_err(err_str)?;
 
                     Ok(())
                 })
                 .await
                 .map_err(err_str)?
                 .map_err(err_str)?;
-                let _ = msg_tx
-                    .lock()
-                    .await
-                    .send(Message::PendingProgress(id, 100.0))
-                    .await;
+                OperationSelection::default()
             }
-        }
+        };
 
-        let _ = msg_tx
-            .lock()
-            .await
-            .send(Message::PendingProgress(id, 100.0))
-            .await;
+        controller_clone.set_progress(100.0);
 
-        Ok(())
+        Ok(paths)
     }
 }
 
@@ -905,7 +957,7 @@ mod tests {
     use test_log::test;
     use tokio::sync;
 
-    use super::{Operation, ReplaceResult};
+    use super::{Controller, Operation, OperationSelection, ReplaceResult};
     use crate::{
         app::{
             test_utils::{
@@ -921,7 +973,10 @@ mod tests {
     const BUF_SIZE: usize = 8;
 
     /// Simple wrapper around `[Operation::Copy]`
-    pub async fn operation_copy(paths: Vec<PathBuf>, to: PathBuf) -> Result<(), String> {
+    pub async fn operation_copy(
+        paths: Vec<PathBuf>,
+        to: PathBuf,
+    ) -> Result<OperationSelection, String> {
         let id = fastrand::u64(0..u64::MAX);
         let (tx, mut rx) = mpsc::channel(BUF_SIZE);
         let paths_clone = paths.clone();
@@ -931,15 +986,12 @@ mod tests {
                 paths: paths_clone,
                 to: to_clone,
             }
-            .perform(id, &sync::Mutex::new(tx).into())
+            .perform(&sync::Mutex::new(tx).into(), Controller::new())
             .await
         });
 
         while let Some(msg) = rx.next().await {
             match msg {
-                Message::PendingProgress(id, progress) => {
-                    trace!("({id}) [ {paths:?} => {to:?} ] {progress}% complete)")
-                }
                 Message::DialogPush(DialogPage::Replace { tx, .. }) => {
                     debug!("[{id}] Replace request");
                     tx.send(ReplaceResult::Cancel).await.expect("Sending a response to a replace request should succeed")
